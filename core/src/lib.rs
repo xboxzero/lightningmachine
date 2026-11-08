@@ -1,25 +1,27 @@
-//! Lightning Machine — 3-D liquid lightning core (Rust → WebAssembly).
+//! Lightning Machine — lightning in a glass lava-lamp chamber (Rust → WebAssembly).
 //!
-//! Units: metres, seconds, amperes, kelvin.
+//! Units: metres, seconds, amperes, coulombs, volts, kelvin.
 //!
-//! Electrostatics — charge pockets are Plummer-softened (Gaussian-like) point charges;
-//!   E(x) = k Σ q (x − x_q) / (|x − x_q|² + a²)^{3/2}.
-//! Leader — 3-D stochastic dielectric-breakdown growth: from each tip K candidate
-//!   directions are drawn; one is chosen with probability ∝ max(0, d̂·Ê)^η · e^{σN(0,1)}
-//!   (continuum form of the Niemeyer–Pietronero–Wiesmann model). Negative leaders
-//!   propagate along −E toward positive charge; tips fork stochastically.
-//! Return stroke — Heidler current (IEC 62305-1 waveforms), MTLE propagation along the
-//!   channel at v = 1.2×10⁸ m/s with λ = 2 km, CIGRE log-normal peak currents,
-//!   subsequent strokes, continuing current.
-//! Channel temperature — weak power law T = 4000 + 26000·(I/30 kA)^0.12 with exponential
-//!   cooling toward the continuing-current equilibrium.
-//! Colour — emission spectrum of air plasma: N II, N I, O I, Hα, Hβ lines weighted by
-//!   Boltzmann excitation e^{−E_u/kT} and the Saha ionisation balance of nitrogen, plus a
-//!   recombination/bremsstrahlung continuum ∝ n_e² ∝ x² times the Planck function;
-//!   integrated against the CIE 1931 colour-matching functions → linear sRGB.
-//! Fluid — Arnold–Beltrami–Childress flow, an exact incompressible Euler solution
-//!   (∇·u = 0), with drifting phases so the strands fold chaotically; RK2 advection,
-//!   resampling and a curvature (surface-tension-like) term.
+//! Lava blobs — buoyant blobs heated at the floor and cooled at the ceiling
+//!   (Newtonian heating/cooling, Boussinesq buoyancy a = g·(T − T_env)/T_env, linear
+//!   Stokes drag). Their charge follows thermionic emission (Richardson–Dushman):
+//!   hot rising blobs turn positive, cold sinking blobs stay negative.
+//! Fluid — the chamber fluid is dragged by the moving blobs: a sum of regularised
+//!   Stokeslets (Cortez 2001), u = (3a/4)[(r²+2ε²)v + (v·d)d]/(r²+ε²)^{3/2}, plus
+//!   Rayleigh–Bénard convection rolls from stream functions. All divergence-free.
+//! Electrostatics — E = k Σ q (x − x_q)/(|x − x_q|² + a²)^{3/2}, k = 8.99×10⁹, q in C.
+//! Leader — 3-D stochastic dielectric breakdown: candidate steps weighted by
+//!   (d̂·Ê)^η × T_WKB(F)^w × e^{σN(0,1)}, sampled by the Born rule (P ∝ |ψ|² ∝ weight).
+//! Quantum tunnelling — Fowler–Nordheim field emission with Murphy–Good barrier functions
+//!   (Forbes 2006): ln T = −v(f)·bφ^{3/2}/F, J = (a/(φt²))F²·T, F = β|E|. J sets the
+//!   stepping rate; T weights each candidate breakdown site.
+//! Connections — leader tips attach to positive blobs or to any existing channel
+//!   (spatial hash); nearby hot channels of different bolts spawn bridging leaders.
+//! Return stroke — Heidler current (IEC 62305-1), MTLE propagation, CIGRE currents,
+//!   re-strikes, continuing current; T = 4000 + 26000·(I/30 kA)^0.12.
+//! Colour — lightning: air-plasma emission (N II/O II/N I/O I/H lines, Boltzmann ×
+//!   Saha, recombination continuum) → CIE 1931 → sRGB. Lava: Planck black body
+//!   (colour temperature).
 
 #![allow(static_mut_refs)]
 
@@ -28,17 +30,26 @@ use std::f32::consts::PI;
 const LUT_N: usize = 1024;
 const LUT_TMIN: f32 = 1500.0;
 const LUT_TMAX: f32 = 40000.0;
+const BB_N: usize = 256;
+const BB_TMIN: f32 = 800.0;
+const BB_TMAX: f32 = 12000.0;
 const SEG_FLOATS: usize = 8;
-const MAX_SEGS: usize = 50000;
-const MAX_BOLTS: usize = 12;
-const NODE_CAP: usize = 2600;
-const HALF: f32 = 1000.0; // half size of the simulation box (m)
-const STEP: f32 = 24.0; // leader step length (m)
+const MAX_SEGS: usize = 60000;
+const MAX_BOLTS: usize = 10;
+const MAX_BRIDGES: usize = 12;
+const MAX_BLOBS: usize = 12;
+const NODE_CAP: usize = 2400;
+const STEP: f32 = 15.0;
+const CELL: f32 = 48.0;
+const COULOMB_K: f32 = 8.99e9;
 
 const H_PLANCK: f64 = 6.626_070_15e-34;
 const C_LIGHT: f64 = 2.997_924_58e8;
 const K_B: f64 = 1.380_649e-23;
 const K_B_EV: f64 = 8.617_333e-5;
+const FN_A: f32 = 1.541_434e-6;
+const FN_B: f32 = 6.830_890e9;
+const FN_C: f32 = 1.439_965e-9;
 
 const V_RS: f32 = 1.2e8;
 const LAMBDA_MTLE: f32 = 2000.0;
@@ -64,7 +75,7 @@ impl Rng {
         let u2 = self.f();
         (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
     }
-    fn gauss3(&mut self) -> [f32; 3] {
+    fn gauss3(&mut self) -> V3 {
         [self.gauss(), self.gauss(), self.gauss()]
     }
     fn lognormal(&mut self, median: f32, s: f32) -> f32 {
@@ -72,7 +83,6 @@ impl Rng {
     }
 }
 
-// ---------------------------------------------------------------- vectors
 type V3 = [f32; 3];
 #[inline]
 fn add(a: V3, b: V3) -> V3 {
@@ -114,57 +124,69 @@ fn planck(lambda_m: f64, t: f64) -> f64 {
     let a = 2.0 * H_PLANCK * C_LIGHT * C_LIGHT / lambda_m.powi(5);
     a / (H_PLANCK * C_LIGHT / (lambda_m * K_B * t)).exp_m1()
 }
-
-/// Saha equation for nitrogen N ⇌ N⁺ + e⁻ → ionisation fraction x.
+fn xyz_to_rgb(x: f64, y: f64, z: f64) -> [f32; 3] {
+    let r = (3.2404542 * x - 1.5371385 * y - 0.4985314 * z).max(0.0);
+    let g = (-0.9692660 * x + 1.8760108 * y + 0.0415560 * z).max(0.0);
+    let b = (0.0556434 * x - 0.2040259 * y + 1.0572252 * z).max(0.0);
+    let m = r.max(g).max(b).max(1e-300);
+    [(r / m) as f32, (g / m) as f32, (b / m) as f32]
+}
+/// Black-body chromaticity (colour temperature) and luminance.
+fn blackbody(t: f64) -> ([f32; 3], f64) {
+    let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
+    let mut l = 360.0;
+    while l <= 830.0 {
+        let b = planck(l * 1e-9, t);
+        let (cx, cy, cz) = cie_xyz(l);
+        x += b * cx;
+        y += b * cy;
+        z += b * cz;
+        l += 2.0;
+    }
+    (xyz_to_rgb(x, y, z), y)
+}
 fn saha_nitrogen(t: f64) -> f64 {
-    let n_tot = 2.5e24; // channel number density after expansion (~0.1 atm)
-    let chi = 14.534; // eV
-    let g_ratio = 2.0 * 9.0 / 4.0;
-    let s = 2.415e21 * t.powf(1.5) * g_ratio * (-chi / (K_B_EV * t)).exp() / n_tot;
-    // x² / (1 − x) = s
+    let n_tot = 2.5e24;
+    let s = 2.415e21 * t.powf(1.5) * 4.5 * (-14.534 / (K_B_EV * t)).exp() / n_tot;
     (-s + (s * s + 4.0 * s).sqrt()) / 2.0
 }
-
-/// Visible emission of lightning channel air plasma at temperature T.
-/// Returns (linear sRGB chromaticity with max = 1, luminance Y in arbitrary units).
+/// Air-plasma emission colour at temperature T (lines + continuum).
 fn lightning_color(t: f64) -> ([f32; 3], f64) {
     let kt = K_B_EV * t;
     let x_ion = saha_nitrogen(t);
-    // (λ nm, upper level energy eV, relative gA·abundance, 1 = ion line / 0 = neutral)
+    // (λ nm, upper level eV, relative gA × abundance, ion?)
     const LINES: [(f64, f64, f64, u8); 21] = [
-        (399.5, 21.60, 0.30, 1), // N II
-        (404.1, 23.42, 0.20, 1), // N II
-        (444.7, 23.20, 0.30, 1), // N II
-        (463.0, 21.16, 0.70, 1), // N II
-        (480.3, 23.24, 0.40, 1), // N II
-        (500.5, 23.14, 1.00, 1), // N II (the blue-green lightning line)
-        (567.9, 20.67, 0.65, 1), // N II
-        (594.2, 23.24, 0.30, 1), // N II
-        (648.2, 20.41, 0.15, 1), // N II
-        (434.9, 25.85, 0.15, 1), // O II
-        (441.5, 26.25, 0.15, 1), // O II
-        (464.9, 25.66, 0.15, 1), // O II
-        (656.3, 12.09, 0.012, 0), // H α (H ≈ 1.5 % of channel atoms, from water vapour)
-        (486.1, 12.75, 0.004, 0), // H β
-        (434.0, 13.05, 0.002, 0), // H γ
-        (746.8, 11.99, 0.60, 0), // N I
-        (821.6, 11.84, 0.50, 0), // N I
-        (777.4, 10.74, 1.00, 0), // O I
-        (844.6, 10.99, 0.50, 0), // O I
-        (715.6, 14.46, 0.30, 0), // O I
-        (615.8, 12.75, 0.40, 0), // O I
+        (399.5, 21.60, 0.30, 1),
+        (404.1, 23.42, 0.20, 1),
+        (444.7, 23.20, 0.30, 1),
+        (463.0, 21.16, 0.70, 1),
+        (480.3, 23.24, 0.40, 1),
+        (500.5, 23.14, 1.00, 1),
+        (567.9, 20.67, 0.65, 1),
+        (594.2, 23.24, 0.30, 1),
+        (648.2, 20.41, 0.15, 1),
+        (434.9, 25.85, 0.15, 1),
+        (441.5, 26.25, 0.15, 1),
+        (464.9, 25.66, 0.15, 1),
+        (656.3, 12.09, 0.012, 0),
+        (486.1, 12.75, 0.004, 0),
+        (434.0, 13.05, 0.002, 0),
+        (746.8, 11.99, 0.60, 0),
+        (821.6, 11.84, 0.50, 0),
+        (777.4, 10.74, 1.00, 0),
+        (844.6, 10.99, 0.50, 0),
+        (715.6, 14.46, 0.30, 0),
+        (615.8, 12.75, 0.40, 0),
     ];
-    let l0 = 3.0e12;
     let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
     for &(lam, eu, g, ion) in LINES.iter() {
         let frac = if ion == 1 { x_ion } else { 1.0 - x_ion };
-        let i = l0 * g * frac * (-eu / kt).exp();
+        let i = 3.0e12 * g * frac * (-eu / kt).exp();
         let (cx, cy, cz) = cie_xyz(lam);
         x += i * cx;
         y += i * cy;
         z += i * cz;
     }
-    // continuum: free–free + free–bound ∝ n_e n_i ∝ x², spectral shape ~ Planck
     let mut lam = 380.0;
     while lam <= 780.0 {
         let b = planck(lam * 1e-9, t) * 1e-9 * 4.0 * x_ion * x_ion * 1.5;
@@ -174,11 +196,32 @@ fn lightning_color(t: f64) -> ([f32; 3], f64) {
         z += b * cz;
         lam += 4.0;
     }
-    let r = (3.2404542 * x - 1.5371385 * y - 0.4985314 * z).max(0.0);
-    let gg = (-0.9692660 * x + 1.8760108 * y + 0.0415560 * z).max(0.0);
-    let bb = (0.0556434 * x - 0.2040259 * y + 1.0572252 * z).max(0.0);
-    let m = r.max(gg).max(bb).max(1e-300);
-    ([(r / m) as f32, (gg / m) as f32, (bb / m) as f32], y)
+    (xyz_to_rgb(x, y, z), y)
+}
+
+// ---------------------------------------------------------------- quantum tunnelling
+/// Fowler–Nordheim with Murphy–Good barrier functions. Returns (ln T_WKB, J [A/m²]).
+fn fowler_nordheim(f_field: f32, phi: f32) -> (f32, f32) {
+    let ff = f_field.max(1.0);
+    let f = (FN_C * ff / (phi * phi)).clamp(1e-6, 1.0);
+    let v = 1.0 - f + (f / 6.0) * f.ln();
+    let tf = 1.0 + f / 9.0 - (f / 18.0) * f.ln();
+    let ln_t = -v * FN_B * phi.powf(1.5) / ff;
+    (ln_t, FN_A / (phi * tf * tf) * ff * ff * ln_t.exp())
+}
+
+fn heidler(t: f32, i0: f32, tau1: f32, tau2: f32, eta: f32) -> f32 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    let x = (t / tau1).powi(10);
+    i0 / eta * x / (1.0 + x) * (-t / tau2).exp()
+}
+fn t_of_current(i: f32) -> f32 {
+    if i <= 1.0 {
+        return T_AMB;
+    }
+    (4000.0 + 26000.0 * (i / 30_000.0).powf(0.12)).min(38_000.0)
 }
 
 // ---------------------------------------------------------------- model
@@ -188,8 +231,8 @@ struct Node {
     parent: i32,
     jit: V3,
     temp: f32,
-    amp: f32,  // fraction of stroke current carried
-    dist: f32, // path length from the attachment point (m)
+    amp: f32,
+    dist: f32,
     depth: u8,
     main: bool,
     alive: bool,
@@ -210,62 +253,95 @@ struct Tip {
 }
 
 struct Bolt {
+    uid: u32,
     nodes: Vec<Node>,
     tips: Vec<Tip>,
     phase: Phase,
+    target: Option<V3>, // bridging leaders aim at a point on another channel
+    bridge: bool,
     step_acc: f32,
     age: f32,
     life: f32,
-    stroke_t: f32, // simulated time since the current stroke started (s)
+    stroke_t: f32,
     i0: f32,
     tau1: f32,
     tau2: f32,
     eta_h: f32,
     t_peak: f32,
-    strokes: u32,
     i_cc: f32,
+    compacted: bool,
 }
 
 #[derive(Clone, Copy)]
-struct Pocket {
+struct Blob {
     p: V3,
-    q: f32, // relative charge (sign matters)
-    a: f32, // softening radius (m)
+    v: V3,
+    temp: f32, // K (lava colour temperature)
+    q: f32,    // C
+    a: f32,    // radius (m)
+}
+
+#[derive(Clone, Copy)]
+struct Link {
+    a_uid: u32,
+    a_idx: usize,
+    b_uid: u32,
+    b_idx: usize,
 }
 
 const P_BOLTS: usize = 0;
-const P_FLOW: usize = 1;
-const P_SWIRL: usize = 2;
-const P_CRACKLE: usize = 3;
-const P_BRANCH: usize = 4;
-const P_ETA: usize = 5;
-const P_LIFE: usize = 6;
-const P_MIC: usize = 7;
-const P_TENSION: usize = 8;
-const P_RESTRIKE: usize = 9;
-const P_IPEAK: usize = 10; // median first-stroke peak current (kA)
-const P_ICC: usize = 11; // continuing current (A)
-const P_SLOWMO: usize = 12; // simulated seconds per real second during strokes
-const P_LEADER_SPEED: usize = 13; // leader steps per real second
-const P_POCKETS: usize = 14;
-const N_PARAMS: usize = 15;
+const P_BLOBS: usize = 1;
+const P_HEAT: usize = 2;
+const P_FLOW: usize = 3;
+const P_ETA: usize = 4;
+const P_QUANTUM: usize = 5;
+const P_BETA_LOG: usize = 6;
+const P_WORKFN: usize = 7;
+const P_BRANCH: usize = 8;
+const P_CONNECT: usize = 9;
+const P_IPEAK: usize = 10;
+const P_ICC: usize = 11;
+const P_RESTRIKE: usize = 12;
+const P_SLOWMO: usize = 13;
+const P_LIFE: usize = 14;
+const P_CRACKLE: usize = 15;
+const P_TENSION: usize = 16;
+const P_MIC: usize = 17;
+const P_LEADER_SPEED: usize = 18;
+const N_PARAMS: usize = 19;
+
+struct Grid {
+    dims: [usize; 3],
+    head: Vec<i32>,
+    next: Vec<i32>,
+    items: Vec<(V3, u16, u32, f32)>, // position, bolt index, node index, temperature
+}
 
 struct Sim {
     rng: Rng,
     p: [f32; N_PARAMS],
+    half: V3,
     time: f32,
-    phase3: V3,
     bolts: Vec<Bolt>,
-    pockets: Vec<Pocket>,
+    blobs: Vec<Blob>,
+    links: Vec<Link>,
+    next_uid: u32,
     spawn_t: f32,
+    bridge_t: f32,
     strikes: u32,
     restrikes: u32,
     strike_pos: V3,
+    fn_j: f32,
+    tip_field: f32,
+    grid: Grid,
     out: Vec<f32>,
+    blob_out: Vec<f32>,
     info: [f32; 16],
     lut: Vec<f32>,
+    bb_lut: Vec<f32>,
     kids: Vec<u16>,
     first_child: Vec<i32>,
+    restrike_req: Vec<u32>,
 }
 
 static mut SIM: Option<Sim> = None;
@@ -273,84 +349,215 @@ fn sim() -> &'static mut Sim {
     unsafe { SIM.as_mut().expect("init() first") }
 }
 
-fn heidler(t: f32, i0: f32, tau1: f32, tau2: f32, eta: f32) -> f32 {
-    if t <= 0.0 {
-        return 0.0;
-    }
-    let x = (t / tau1).powi(10);
-    i0 / eta * x / (1.0 + x) * (-t / tau2).exp()
+fn cell_of(p: V3, h: V3, dims: [usize; 3]) -> usize {
+    let cx = (((p[0] + h[0]) / CELL).max(0.0) as usize).min(dims[0] - 1);
+    let cy = (((p[1] + h[1]) / CELL).max(0.0) as usize).min(dims[1] - 1);
+    let cz = (((p[2] + h[2]) / CELL).max(0.0) as usize).min(dims[2] - 1);
+    cx + dims[0] * (cy + dims[1] * cz)
 }
 
-fn t_of_current(i: f32) -> f32 {
-    // Weak power law: spectroscopy (Orville 1968) finds peak channel temperatures of
-    // ~28–31 kK for strokes of very different current, so T depends only weakly on I.
-    if i <= 1.0 {
-        return T_AMB;
+fn placeholder() -> Bolt {
+    Bolt {
+        uid: 0,
+        nodes: Vec::new(),
+        tips: Vec::new(),
+        phase: Phase::Fizzle,
+        target: None,
+        bridge: false,
+        step_acc: 0.0,
+        age: 0.0,
+        life: 0.0,
+        stroke_t: 0.0,
+        i0: 0.0,
+        tau1: 1.0,
+        tau2: 1.0,
+        eta_h: 1.0,
+        t_peak: 0.0,
+        i_cc: 0.0,
+        compacted: false,
     }
-    (4000.0 + 26000.0 * (i / 30_000.0).powf(0.12)).min(38_000.0)
 }
 
 impl Sim {
     fn new(seed: u32) -> Sim {
         let mut p = [0.0; N_PARAMS];
         p[P_BOLTS] = 5.0;
+        p[P_BLOBS] = 7.0;
+        p[P_HEAT] = 1.0;
         p[P_FLOW] = 1.0;
-        p[P_SWIRL] = 1.0;
-        p[P_CRACKLE] = 0.5;
-        p[P_BRANCH] = 0.6;
-        p[P_ETA] = 3.0;
-        p[P_LIFE] = 10.0;
-        p[P_TENSION] = 0.3;
-        p[P_RESTRIKE] = 1.0;
+        p[P_ETA] = 2.6;
+        p[P_QUANTUM] = 0.25;
+        p[P_BETA_LOG] = 4.4;
+        p[P_WORKFN] = 4.5;
+        p[P_BRANCH] = 0.7;
+        p[P_CONNECT] = 170.0;
         p[P_IPEAK] = 31.0;
         p[P_ICC] = 2500.0;
+        p[P_RESTRIKE] = 1.0;
         p[P_SLOWMO] = 0.0005;
-        p[P_LEADER_SPEED] = 160.0;
-        p[P_POCKETS] = 2.0;
+        p[P_LIFE] = 11.0;
+        p[P_CRACKLE] = 0.45;
+        p[P_TENSION] = 0.3;
+        p[P_LEADER_SPEED] = 170.0;
         let mut s = Sim {
             rng: Rng(0x853c49e6748fea9b ^ ((seed as u64) << 21 | seed as u64)),
             p,
+            half: [1600.0, 1000.0, 800.0],
             time: 0.0,
-            phase3: [0.0; 3],
             bolts: Vec::new(),
-            pockets: Vec::new(),
+            blobs: Vec::new(),
+            links: Vec::new(),
+            next_uid: 1,
             spawn_t: 0.0,
+            bridge_t: 0.0,
             strikes: 0,
             restrikes: 0,
             strike_pos: [0.0; 3],
+            fn_j: 0.0,
+            tip_field: 0.0,
+            grid: Grid { dims: [1, 1, 1], head: vec![-1], next: Vec::new(), items: Vec::new() },
             out: vec![0.0; MAX_SEGS * SEG_FLOATS],
+            blob_out: vec![0.0; MAX_BLOBS * 8],
             info: [0.0; 16],
             lut: vec![0.0; LUT_N * 4],
+            bb_lut: vec![0.0; BB_N * 4],
             kids: Vec::new(),
             first_child: Vec::new(),
+            restrike_req: Vec::new(),
         };
         let yref = lightning_color(30000.0).1;
         for i in 0..LUT_N {
             let t = LUT_TMIN + (LUT_TMAX - LUT_TMIN) * i as f32 / (LUT_N - 1) as f32;
             let (c, y) = lightning_color(t as f64);
             s.lut[i * 4..i * 4 + 3].copy_from_slice(&c);
-            // perceived brightness: Fechner's law (logarithmic) over ~7 decades of luminance,
-            // squared to keep strong contrast between the flash and the glowing channel
+            // perceived brightness: Fechner's law over ~7 decades
             let f = (1.0 + (y / yref).max(1e-30).log10() / 7.0).max(0.0);
             s.lut[i * 4 + 3] = (f * f) as f32;
+        }
+        let yb = blackbody(2500.0).1;
+        for i in 0..BB_N {
+            let t = BB_TMIN + (BB_TMAX - BB_TMIN) * i as f32 / (BB_N - 1) as f32;
+            let (c, y) = blackbody(t as f64);
+            s.bb_lut[i * 4..i * 4 + 3].copy_from_slice(&c);
+            // perceived brightness (Stevens' power law, exponent 1/3)
+            s.bb_lut[i * 4 + 3] = ((y / yb) as f32).powf(1.0 / 3.0);
         }
         s
     }
 
-    // ------------------------------------------------------------ fluid (ABC flow)
+    fn inside(&self, x: V3, margin: f32) -> bool {
+        (0..3).all(|i| x[i].abs() < self.half[i] - margin)
+    }
+
+    // ------------------------------------------------------------ lava blobs
+    fn ensure_blobs(&mut self) {
+        let n = (self.p[P_BLOBS] as usize).clamp(2, MAX_BLOBS);
+        let h = self.half;
+        while self.blobs.len() < n {
+            let neg = self.blobs.len() % 2 == 0;
+            let hot = self.rng.f() < 0.5;
+            let b = Blob {
+                p: [self.rng.range(-0.8, 0.8) * h[0], self.rng.range(-0.8, 0.8) * h[1], self.rng.range(-0.7, 0.7) * h[2]],
+                v: [0.0; 3],
+                temp: if hot { 2500.0 } else { 1400.0 },
+                q: if neg { -1.0 } else { 1.0 } * self.rng.range(8.0, 16.0),
+                a: self.rng.range(0.10, 0.16) * h[1],
+            };
+            self.blobs.push(b);
+        }
+        self.blobs.truncate(n);
+    }
+
+    fn move_blobs(&mut self, dt: f32) {
+        let h = self.half;
+        let heat = self.p[P_HEAT] * (1.0 + self.p[P_MIC]);
+        let n = self.blobs.len();
+        let (t_env, t_hot, t_cold) = (1900.0f32, 2700.0f32, 1250.0f32);
+        let g = 9.81f32;
+        for i in 0..n {
+            let mut acc = [0.0f32; 3];
+            let b = self.blobs[i];
+            // Boussinesq buoyancy (scaled to the chamber): a_y = g·(T − T_env)/T_env
+            acc[1] += g * (b.temp - t_env) / t_env * 9.0 * heat;
+            // soft contact between blobs
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let d = sub(b.p, self.blobs[j].p);
+                let r = len(d);
+                let rr = (b.a + self.blobs[j].a) * 1.1;
+                if r < rr && r > 1e-3 {
+                    acc = add(acc, mul(d, (rr - r) / r * 0.6));
+                }
+            }
+            for k in 0..3 {
+                let lim = h[k] - b.a;
+                if b.p[k] > lim {
+                    acc[k] -= (b.p[k] - lim) * 1.5;
+                }
+                if b.p[k] < -lim {
+                    acc[k] += (-lim - b.p[k]) * 1.5;
+                }
+            }
+            acc = add(acc, mul(self.rng.gauss3(), 6.0));
+            let bm = &mut self.blobs[i];
+            bm.v = add(bm.v, mul(sub(acc, mul(bm.v, 0.35)), dt)); // Stokes drag
+            bm.p = add(bm.p, mul(bm.v, dt));
+            // Newtonian heating at the floor, cooling at the ceiling
+            let yrel = bm.p[1] / h[1];
+            let (target, rate) = if yrel < -0.65 {
+                (t_hot, 0.35 * heat)
+            } else if yrel > 0.6 {
+                (t_cold, 0.35 * heat)
+            } else {
+                (t_env, 0.01)
+            };
+            bm.temp += (target - bm.temp) * (rate * dt).min(1.0);
+            // thermionic charging (Richardson–Dushman J = A·T²·e^{−W/kT}): hot blobs boil off
+            // electrons and turn positive, cold blobs keep a negative charge
+            let w_ev = 2.0f32; // effective work function of the lava surface (eV)
+            let rd = |t: f32| t * t * (-w_ev / (8.617e-5 * t)).exp();
+            let j_rel = rd(bm.temp) / rd(t_env);
+            bm.q = 14.0 * (j_rel.ln() / 2.5).tanh();
+            for k in 0..3 {
+                bm.p[k] = bm.p[k].clamp(-h[k] + bm.a * 0.5, h[k] - bm.a * 0.5);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ fluid
     fn velocity(&self, x: V3) -> V3 {
-        let k = PI / HALF * self.p[P_SWIRL];
-        let (a, b, c) = (1.0f32, 0.816_496_6f32, 0.577_350_3f32); // A=1, B=√(2/3), C=√(1/3)
-        let ph = self.phase3;
-        let (px, py, pz) = (x[0] * k + ph[0], x[1] * k + ph[1], x[2] * k + ph[2]);
-        let mut u = [a * pz.sin() + c * py.cos(), b * px.sin() + a * pz.cos(), c * py.sin() + b * px.cos()];
-        let speed = 0.10 * HALF * self.p[P_FLOW] * (1.0 + 1.5 * self.p[P_MIC]);
-        u = mul(u, speed);
-        // soft walls: suppress outward motion near the box faces so strands slide along them
+        let h = self.half;
+        let mut u = [0.0f32; 3];
+        // regularised Stokeslets: the fluid is dragged along by every moving blob
+        for b in self.blobs.iter() {
+            let d = sub(x, b.p);
+            let r2 = dot(d, d);
+            let e2 = b.a * b.a;
+            let den = (r2 + e2).powf(1.5);
+            let c1 = (r2 + 2.0 * e2) / den;
+            let c2 = dot(b.v, d) / den;
+            u = add(u, mul(add(mul(b.v, c1), mul(d, c2)), 0.75 * b.a));
+        }
+        // Rayleigh–Bénard rolls from stream functions (x–y roll and y–z roll)
+        let flow = self.p[P_FLOW] * (1.0 + 1.5 * self.p[P_MIC]);
+        let xx = (x[0] + h[0]) / (2.0 * h[0]);
+        let yy = (x[1] + h[1]) / (2.0 * h[1]);
+        let zz = (x[2] + h[2]) / (2.0 * h[2]);
+        let uu = 60.0 * flow;
+        let ph = self.time * 0.05;
+        let m1 = (2.0 * PI * zz + ph).cos();
+        u[0] += uu * (PI * xx).sin() * (PI * yy).cos() * m1 * (h[0] / h[1]);
+        u[1] += -uu * (PI * xx).cos() * (PI * yy).sin() * m1;
+        let m2 = (2.0 * PI * xx + ph).sin() * 0.6;
+        u[1] += uu * (PI * yy).sin() * (PI * zz).cos() * m2;
+        u[2] += -uu * (PI * yy).cos() * (PI * zz).sin() * m2 * (h[2] / h[1]);
+        // glass walls: no flow through the glass
         for i in 0..3 {
             let d = x[i].abs();
-            if x[i] * u[i] > 0.0 && d > HALF * 0.8 {
-                let s = ((HALF - d) / (HALF * 0.2)).clamp(0.0, 1.0);
+            if x[i] * u[i] > 0.0 && d > h[i] * 0.85 {
+                let s = ((h[i] - d) / (h[i] * 0.15)).clamp(0.0, 1.0);
                 u[i] *= s * s * (3.0 - 2.0 * s);
             }
         }
@@ -360,172 +567,220 @@ impl Sim {
     // ------------------------------------------------------------ electrostatics
     fn efield(&self, x: V3) -> V3 {
         let mut e = [0.0f32; 3];
-        for pk in self.pockets.iter() {
-            let d = sub(x, pk.p);
-            let r2 = dot(d, d) + pk.a * pk.a;
-            let k = pk.q / (r2 * r2.sqrt());
-            e = add(e, mul(d, k));
+        for b in self.blobs.iter() {
+            let d = sub(x, b.p);
+            let r2 = dot(d, d) + b.a * b.a;
+            e = add(e, mul(d, COULOMB_K * b.q / (r2 * r2.sqrt())));
         }
         e
     }
 
-    /// Thundercloud tripole: main negative layer in the middle, upper positive layer,
-    /// weaker lower positive charge region (LPCR). Each "set" adds one of each.
-    fn layer_y(kind: usize) -> f32 {
-        match kind {
-            0 => -0.05 * HALF, // main negative
-            1 => 0.70 * HALF,  // upper positive
-            _ => -0.72 * HALF, // lower positive
-        }
-    }
-    fn ensure_pockets(&mut self) {
-        let n = (self.p[P_POCKETS] as usize).clamp(1, 6);
-        while self.pockets.len() < 3 * n {
-            let kind = self.pockets.len() % 3;
-            let p = [self.rng.range(-0.75, 0.75) * HALF, Sim::layer_y(kind) + self.rng.gauss() * 0.08 * HALF, self.rng.range(-0.75, 0.75) * HALF];
-            let (q, a) = match kind {
-                0 => (-1.0, self.rng.range(140.0, 220.0)),
-                1 => (1.0, self.rng.range(160.0, 240.0)),
-                _ => (0.45, self.rng.range(90.0, 140.0)),
-            };
-            self.pockets.push(Pocket { p, q: q * self.rng.range(0.8, 1.2) * 1e6, a });
-        }
-        self.pockets.truncate(3 * n);
-    }
-
-    fn move_pockets(&mut self, dt: f32) {
-        for i in 0..self.pockets.len() {
-            let v = self.velocity(self.pockets[i].p);
-            let wander = mul(self.rng.gauss3(), 30.0 * dt.sqrt());
-            let ly = Sim::layer_y(i % 3);
-            let pk = &mut self.pockets[i];
-            // charge regions drift horizontally with the air; gravity-driven charge
-            // separation keeps each layer at its height
-            pk.p = add(add(pk.p, mul([v[0], v[1] * 0.2, v[2]], dt * 0.5)), wander);
-            pk.p[1] += (ly - pk.p[1]) * (dt * 0.5).min(1.0);
-            for j in 0..3 {
-                pk.p[j] = pk.p[j].clamp(-0.85 * HALF, 0.85 * HALF);
+    // ------------------------------------------------------------ spatial hash
+    fn build_grid(&mut self) {
+        let h = self.half;
+        let dims = [((2.0 * h[0] / CELL) as usize + 2), ((2.0 * h[1] / CELL) as usize + 2), ((2.0 * h[2] / CELL) as usize + 2)];
+        let nc = dims[0] * dims[1] * dims[2];
+        let g = &mut self.grid;
+        g.dims = dims;
+        g.head.clear();
+        g.head.resize(nc, -1);
+        g.next.clear();
+        g.items.clear();
+        for (bi, b) in self.bolts.iter().enumerate() {
+            for (ni, nd) in b.nodes.iter().enumerate() {
+                if !nd.alive {
+                    continue;
+                }
+                let c = cell_of(nd.p, h, dims);
+                g.items.push((nd.p, bi as u16, ni as u32, nd.temp));
+                g.next.push(g.head[c]);
+                g.head[c] = (g.items.len() - 1) as i32;
             }
         }
+    }
+
+    /// Nearest grid item within radius r that belongs to a different bolt.
+    fn query(&self, x: V3, r: f32, exclude_bolt: usize, min_temp: f32) -> Option<(usize, usize, V3)> {
+        let h = self.half;
+        let g = &self.grid;
+        let c = [((x[0] + h[0]) / CELL) as i32, ((x[1] + h[1]) / CELL) as i32, ((x[2] + h[2]) / CELL) as i32];
+        let reach = (r / CELL).ceil() as i32;
+        let mut best: Option<(usize, usize, V3)> = None;
+        let mut bd = r * r;
+        for dz in -reach..=reach {
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    let (cx, cy, cz) = (c[0] + dx, c[1] + dy, c[2] + dz);
+                    if cx < 0 || cy < 0 || cz < 0 || cx >= g.dims[0] as i32 || cy >= g.dims[1] as i32 || cz >= g.dims[2] as i32 {
+                        continue;
+                    }
+                    let mut it = g.head[cx as usize + g.dims[0] * (cy as usize + g.dims[1] * cz as usize)];
+                    while it >= 0 {
+                        let (p, bi, ni, t) = g.items[it as usize];
+                        if bi as usize != exclude_bolt && t >= min_temp {
+                            let d2 = dot(sub(p, x), sub(p, x));
+                            if d2 < bd {
+                                bd = d2;
+                                best = Some((bi as usize, ni as usize, p));
+                            }
+                        }
+                        it = g.next[it as usize];
+                    }
+                }
+            }
+        }
+        best
     }
 
     // ------------------------------------------------------------ bolts
-    fn spawn_bolt(&mut self) {
-        if self.bolts.len() >= MAX_BOLTS || self.pockets.len() < 2 {
-            return;
-        }
-        // pick a negative pocket and the nearest positive pocket
-        let negs: Vec<usize> = (0..self.pockets.len()).filter(|&i| self.pockets[i].q < 0.0).collect();
-        let src = negs[(self.rng.f() * negs.len() as f32) as usize % negs.len()];
-        // target: a positive pocket chosen with probability ∝ distance (long channels)
-        let mut dst = usize::MAX;
-        let mut wsum = 0.0;
-        let mut ws = Vec::new();
-        for (i, pk) in self.pockets.iter().enumerate() {
-            if pk.q > 0.0 {
-                let d = len(sub(pk.p, self.pockets[src].p));
-                let w = d * d;
-                ws.push((i, w));
-                wsum += w;
-            }
-        }
-        let mut r = self.rng.f() * wsum;
-        for &(i, w) in ws.iter() {
-            dst = i;
-            r -= w;
-            if r <= 0.0 {
-                break;
-            }
-        }
-        if dst == usize::MAX {
-            return;
-        }
-        let start = add(self.pockets[src].p, mul(self.rng.gauss3(), self.pockets[src].a * 0.4));
-        let dir = norm(sub(self.pockets[dst].p, start));
+    fn new_bolt(&mut self, start: V3, dir: V3, target: Option<V3>, bridge: bool) {
         let root = Node { p: start, parent: -1, jit: [0.0; 3], temp: 16000.0, amp: 0.0, dist: 0.0, depth: 0, main: false, alive: true };
-        let life = self.p[P_LIFE] * self.rng.range(0.7, 1.3);
-        self.bolts.push(Bolt {
-            nodes: vec![root],
-            tips: vec![Tip { node: 0, dir, steps: 0, depth: 0 }],
-            phase: Phase::Leader,
-            step_acc: 0.0,
-            age: 0.0,
-            life,
-            stroke_t: 0.0,
-            i0: 0.0,
-            tau1: 1.82e-6,
-            tau2: 285e-6,
-            eta_h: 0.986,
-            t_peak: 3.5e-6,
-            strokes: 0,
-            i_cc: 0.0,
-        });
+        let life = self.p[P_LIFE] * self.rng.range(0.7, 1.3) * if bridge { 0.6 } else { 1.0 };
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        let mut b = placeholder();
+        b.uid = uid;
+        b.nodes = vec![root];
+        b.tips = vec![Tip { node: 0, dir, steps: 0, depth: 0 }];
+        b.phase = Phase::Leader;
+        b.target = target;
+        b.bridge = bridge;
+        b.life = life;
+        self.bolts.push(b);
     }
 
-    /// One stepped-leader step for every active tip (3-D stochastic DBM).
-    fn leader_step(&mut self, b: &mut Bolt) {
+    fn spawn_main(&mut self) {
+        let negs: Vec<usize> = (0..self.blobs.len()).filter(|&i| self.blobs[i].q < 0.0).collect();
+        if negs.is_empty() {
+            return;
+        }
+        let b = self.blobs[negs[(self.rng.f() * negs.len() as f32) as usize % negs.len()]];
+        let d = norm(self.rng.gauss3());
+        let start = add(b.p, mul(d, b.a * 1.05));
+        let e = mul(self.efield(start), -1.0);
+        self.new_bolt(start, norm(add(norm(e), d)), None, false);
+    }
+
+    fn spawn_bridge(&mut self) {
+        let nb = self.bolts.len();
+        if nb < 2 || self.bolts.iter().filter(|b| b.bridge).count() >= MAX_BRIDGES {
+            return;
+        }
+        let r = self.p[P_CONNECT];
+        for _ in 0..6 {
+            let bi = (self.rng.f() * nb as f32) as usize % nb;
+            let b = &self.bolts[bi];
+            if b.phase != Phase::Connected || b.nodes.len() < 4 {
+                continue;
+            }
+            let ni = (self.rng.f() * b.nodes.len() as f32) as usize % b.nodes.len();
+            let nd = b.nodes[ni];
+            if !nd.alive || nd.temp < 8000.0 {
+                continue;
+            }
+            if let Some((_, _, q)) = self.query(nd.p, r, bi, 8000.0) {
+                if len(sub(q, nd.p)) > STEP * 2.0 {
+                    let dir = norm(sub(q, nd.p));
+                    self.new_bolt(nd.p, dir, Some(q), true);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn leader_step(&mut self, bi: usize, b: &mut Bolt) {
         let eta = self.p[P_ETA];
+        let qw = self.p[P_QUANTUM];
+        let beta = 10f32.powf(self.p[P_BETA_LOG]);
+        let phi = self.p[P_WORKFN];
         let branch = self.p[P_BRANCH];
+        let capture = STEP * 1.3;
         let mut new_tips = Vec::new();
-        let mut connected: Option<usize> = None;
+        let mut connected: Option<(usize, Option<(usize, usize)>)> = None;
         let tips = std::mem::take(&mut b.tips);
         for tip in tips.into_iter() {
             if b.nodes.len() >= NODE_CAP / 2 {
                 break;
             }
             let p = b.nodes[tip.node].p;
-            // negative leader advances along −E (toward positive charge)
-            let e = mul(self.efield(p), -1.0);
-            let ehat = norm(e);
+            let e = self.efield(p);
+            let emag = len(e);
+            let mut ehat = mul(e, -1.0 / emag.max(1e-9)); // negative leader → along −E
+            if let Some(t) = b.target {
+                ehat = norm(add(mul(norm(sub(t, p)), 1.6), mul(ehat, 0.4)));
+            }
             const K: usize = 10;
             let mut cand = [[0.0f32; 3]; K];
-            let mut w = [0.0f32; K];
-            let mut wsum = 0.0;
+            let mut lw = [0.0f32; K];
+            let mut mx = f32::MIN;
             for k in 0..K {
-                let d = norm(add(add(mul(tip.dir, 1.0), mul(ehat, 0.6)), mul(self.rng.gauss3(), 0.75)));
+                let d = norm(add(add(tip.dir, mul(ehat, 0.7)), mul(self.rng.gauss3(), 0.75)));
                 let c = dot(d, ehat).max(0.02);
-                let wk = c.powf(eta) * (0.5 * self.rng.gauss()).exp();
+                // local field at the candidate site → WKB tunnelling probability
+                let fq = len(self.efield(add(p, mul(d, STEP)))) * beta;
+                let (ln_t, _) = fowler_nordheim(fq, phi);
+                lw[k] = eta * c.ln() + qw * ln_t + 0.5 * self.rng.gauss();
                 cand[k] = d;
-                w[k] = wk;
-                wsum += wk;
+                mx = mx.max(lw[k]);
             }
-            let mut r = self.rng.f() * wsum;
+            // Born-rule sampling: P ∝ |ψ|² ∝ exp(lw)
+            let mut tot = 0.0;
+            for w in lw.iter_mut() {
+                *w = (*w - mx).exp();
+                tot += *w;
+            }
+            let mut r = self.rng.f() * tot;
             let mut pick = K - 1;
             for k in 0..K {
-                r -= w[k];
+                r -= lw[k];
                 if r <= 0.0 {
                     pick = k;
                     break;
                 }
             }
             let d = cand[pick];
+            self.tip_field = emag;
+            self.fn_j = fowler_nordheim(emag * beta, phi).1;
             let l = STEP * self.rng.range(0.7, 1.3);
             let q = add(p, mul(d, l));
             let depth = tip.depth;
             b.nodes.push(Node { p: q, parent: tip.node as i32, jit: mul(self.rng.gauss3(), 0.3), temp: 20000.0, amp: 0.0, dist: 0.0, depth, main: false, alive: true });
             let ni = b.nodes.len() - 1;
-            // attachment: the leader reaches any positive charge region
-            if self.pockets.iter().any(|pk| pk.q > 0.0 && len(sub(q, pk.p)) < pk.a * 0.9) {
-                connected = Some(ni);
+            // attachment: a positive blob, an existing channel of another bolt, or the bridge target
+            if self.blobs.iter().any(|bl| bl.q > 0.0 && len(sub(q, bl.p)) < bl.a * 1.05) {
+                connected = Some((ni, None));
                 break;
             }
-            let outside = q.iter().any(|v| v.abs() > HALF * 1.05);
-            if outside || tip.steps > 400 {
-                continue; // tip dies
+            if let Some((obi, oni, _)) = self.query(q, capture, bi, 2500.0) {
+                connected = Some((ni, Some((obi, oni))));
+                break;
+            }
+            if let Some(t) = b.target {
+                if len(sub(q, t)) < capture {
+                    connected = Some((ni, None));
+                    break;
+                }
+            }
+            if !self.inside(q, 5.0) || tip.steps > 700 {
+                continue;
             }
             new_tips.push(Tip { node: ni, dir: d, steps: tip.steps + 1, depth });
-            // stochastic fork: the new branch is one order higher (thinner, less current)
-            if depth < 4 && self.rng.f() < branch * 0.06 {
+            if depth < 4 && self.rng.f() < branch * if b.bridge { 0.02 } else { 0.06 } {
                 let bd = norm(add(d, mul(self.rng.gauss3(), 0.9)));
                 new_tips.push(Tip { node: ni, dir: bd, steps: tip.steps + 1, depth: depth + 1 });
             }
         }
-        if let Some(att) = connected {
+        if let Some((att, other)) = connected {
+            if let Some((obi, oni)) = other {
+                let ouid = self.bolts.get(obi).map(|x| x.uid).unwrap_or(0);
+                self.links.push(Link { a_uid: b.uid, a_idx: att, b_uid: ouid, b_idx: oni });
+                self.restrike_req.push(ouid); // current flows into the other channel too
+            }
             self.connect(b, att);
         } else {
             b.tips = new_tips;
             if b.tips.is_empty() {
-                b.phase = Phase::Fizzle; // leader died in the air: no return stroke
+                b.phase = Phase::Fizzle;
                 b.life = b.age + 0.6;
             }
         }
@@ -534,7 +789,6 @@ impl Sim {
     fn connect(&mut self, b: &mut Bolt, att: usize) {
         b.tips.clear();
         b.phase = Phase::Connected;
-        // main channel = path from the attachment point back to the root
         let mut c = att as i32;
         let mut d = 0.0;
         let mut prev: Option<V3> = None;
@@ -550,8 +804,7 @@ impl Sim {
             prev = Some(n.p);
             c = n.parent;
         }
-        // side branches: walk the tree outward from the root (breadth-first) so every
-        // parent is processed before its children; branch current decays along the branch
+        // breadth-first from the root so parents are processed before children
         let n = b.nodes.len();
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut queue = Vec::with_capacity(n);
@@ -584,16 +837,17 @@ impl Sim {
     }
 
     fn begin_stroke(&mut self, b: &mut Bolt, first: bool) {
+        let scale = if b.bridge { 0.5 } else { 1.0 };
         if first {
-            // CIGRE: first negative stroke median 31 kA, σ_ln 0.48; IEC 1/200 µs
-            b.i0 = self.rng.lognormal(self.p[P_IPEAK], 0.48) * 1e3;
+            // CIGRE first stroke: median 31 kA, σ_ln 0.48; IEC 1/200 µs
+            b.i0 = self.rng.lognormal(self.p[P_IPEAK], 0.48) * 1e3 * scale;
             b.tau1 = 1.82e-6;
             b.tau2 = 285e-6;
             b.eta_h = 0.986;
             self.strikes += 1;
         } else {
-            // subsequent: median 12 kA, σ_ln 0.53; IEC 0.25/100 µs
-            b.i0 = self.rng.lognormal(self.p[P_IPEAK] * 12.0 / 31.0, 0.53) * 1e3;
+            // subsequent strokes: median 12 kA, σ_ln 0.53; IEC 0.25/100 µs
+            b.i0 = self.rng.lognormal(self.p[P_IPEAK] * 12.0 / 31.0, 0.53) * 1e3 * scale;
             b.tau1 = 0.454e-6;
             b.tau2 = 143e-6;
             b.eta_h = 0.993;
@@ -601,14 +855,12 @@ impl Sim {
         }
         b.t_peak = b.tau1 * (10.0 * b.tau2 / b.tau1).powf(1.0 / 11.0);
         b.stroke_t = 0.0;
-        b.strokes += 1;
     }
 
-    fn update_bolt(&mut self, b: &mut Bolt, dt: f32) {
+    fn update_bolt(&mut self, bi: usize, b: &mut Bolt, dt: f32) {
         b.age += dt;
         let ou_k = (-dt / 0.08f32).exp();
         let ou_s = (1.0 - ou_k * ou_k).sqrt() * 0.45;
-        // --- liquid motion (RK2 through the ABC flow)
         for nd in b.nodes.iter_mut() {
             if !nd.alive {
                 continue;
@@ -617,24 +869,27 @@ impl Sim {
             let v2 = self.velocity(add(nd.p, mul(v1, dt * 0.5)));
             nd.p = add(nd.p, mul(v2, dt));
             for j in 0..3 {
+                nd.p[j] = nd.p[j].clamp(-self.half[j] + 2.0, self.half[j] - 2.0);
                 nd.jit[j] = nd.jit[j] * ou_k + ou_s * self.rng.gauss();
             }
         }
-        // --- leader growth
         if b.phase == Phase::Leader {
-            b.step_acc += dt * self.p[P_LEADER_SPEED] * (1.0 + 2.0 * self.p[P_MIC]);
+            // stepping rate ∝ (J_FN / J_ref)^0.15
+            let beta = 10f32.powf(self.p[P_BETA_LOG]);
+            let jref = fowler_nordheim(1.0e5 * beta, self.p[P_WORKFN]).1;
+            let fnm = if self.fn_j > 0.0 && jref > 0.0 { (self.fn_j / jref).powf(0.15).clamp(0.3, 3.0) } else { 1.0 };
+            let speed = self.p[P_LEADER_SPEED] * fnm * (1.0 + 2.0 * self.p[P_MIC]) * if b.bridge { 1.6 } else { 1.0 };
+            b.step_acc += dt * speed;
             let mut n = 0;
-            while b.step_acc >= 1.0 && b.phase == Phase::Leader && n < 12 {
+            while b.step_acc >= 1.0 && b.phase == Phase::Leader && n < 14 {
                 b.step_acc -= 1.0;
                 n += 1;
-                self.leader_step(b);
+                self.leader_step(bi, b);
             }
         }
-        // --- electrical state → temperature
         let sim_dt = dt * self.p[P_SLOWMO];
         match b.phase {
             Phase::Leader | Phase::Fizzle => {
-                // leader channel: hot stepping tips, faint channel behind
                 let k = (-dt / 0.06f32).exp();
                 for nd in b.nodes.iter_mut() {
                     nd.temp = 4200.0 + (nd.temp - 4200.0) * k;
@@ -644,7 +899,6 @@ impl Sim {
                 }
             }
             Phase::Connected => {
-                // restrikes (dart leader + subsequent return stroke)
                 let rate = self.p[P_RESTRIKE] * (1.0 + 3.0 * self.p[P_MIC]);
                 if b.stroke_t > 400e-6 && self.rng.f() < rate * dt && b.age < b.life * 0.8 {
                     self.begin_stroke(b, false);
@@ -652,18 +906,16 @@ impl Sim {
                 let t0 = b.stroke_t;
                 let t1 = t0 + sim_dt;
                 b.stroke_t = t1;
-                // continuing current decays over the bolt's life
                 let lf = (1.0 - b.age / b.life).clamp(0.0, 1.0);
-                b.i_cc = self.p[P_ICC] * lf.powf(1.5);
-                let tau_cool = 80e-6;
-                let kc = (-sim_dt / tau_cool).exp();
+                b.i_cc = self.p[P_ICC] * lf.powf(1.5) * if b.bridge { 0.5 } else { 1.0 };
+                let kc = (-sim_dt / 80e-6f32).exp();
                 for nd in b.nodes.iter_mut() {
                     if !nd.alive {
                         continue;
                     }
                     let mut i = 0.0;
                     if nd.amp > 0.0 {
-                        // MTLE: i(z,t) = i(0, t − z/v)·e^{−z/λ}; max over the frame window
+                        // MTLE: i(z,t) = i(0, t − z/v)·e^{−z/λ}, max over the frame window
                         let delay = nd.dist / V_RS;
                         let (a, bb) = (t0 - delay, t1 - delay);
                         let mut im = heidler(a, b.i0, b.tau1, b.tau2, b.eta_h).max(heidler(bb, b.i0, b.tau1, b.tau2, b.eta_h));
@@ -702,7 +954,6 @@ impl Sim {
             }
         }
         let tip_nodes: Vec<usize> = b.tips.iter().map(|t| t.node).collect();
-        // surface tension
         let k = (self.p[P_TENSION] * dt * 12.0).min(0.5);
         if k > 0.0 {
             for i in 0..n {
@@ -716,14 +967,12 @@ impl Sim {
                 b.nodes[i].p = add(p, mul(sub(m, p), k));
             }
         }
-        // prune cold dead-end branches (they stop conducting and fade)
         for i in 0..n {
             let nd = b.nodes[i];
             if nd.alive && !nd.main && self.kids[i] == 0 && nd.temp < 1200.0 && b.phase != Phase::Leader && !tip_nodes.contains(&i) {
                 b.nodes[i].alive = false;
             }
         }
-        // split stretched links / merge compressed ones
         for i in 0..n {
             if !b.nodes[i].alive || b.nodes[i].parent < 0 {
                 continue;
@@ -752,9 +1001,8 @@ impl Sim {
             }
         }
         if b.nodes.len() >= NODE_CAP && b.life > b.age + 1.5 {
-            b.life = b.age + 1.5; // over-stretched: let it cool down and go
+            b.life = b.age + 1.5;
         }
-        // compact
         let dead = b.nodes.iter().filter(|x| !x.alive).count();
         if dead > 300 && dead * 3 > b.nodes.len() {
             let mut remap = vec![-1i32; b.nodes.len()];
@@ -774,6 +1022,7 @@ impl Sim {
                 t.node = remap[t.node].max(0) as usize;
             }
             b.nodes = out;
+            b.compacted = true;
         }
     }
 
@@ -782,25 +1031,48 @@ impl Sim {
         self.time += dt;
         self.strikes = 0;
         self.restrikes = 0;
-        // ABC phases drift → time-dependent chaotic folding
-        let fl = self.p[P_FLOW];
-        self.phase3[0] += dt * 0.11 * fl;
-        self.phase3[1] -= dt * 0.07 * fl;
-        self.phase3[2] += dt * 0.05 * fl;
-        self.ensure_pockets();
-        self.move_pockets(dt);
+        self.ensure_blobs();
+        self.move_blobs(dt);
+        self.build_grid();
         let want = (self.p[P_BOLTS] as usize).clamp(0, MAX_BOLTS);
+        let mains = self.bolts.iter().filter(|b| !b.bridge).count();
         self.spawn_t -= dt;
-        if self.bolts.len() < want && self.spawn_t <= 0.0 {
-            self.spawn_bolt();
-            self.spawn_t = self.rng.range(0.2, 0.8) / (1.0 + 2.0 * self.p[P_MIC]);
+        if mains < want && self.spawn_t <= 0.0 {
+            self.spawn_main();
+            self.spawn_t = self.rng.range(0.2, 0.7) / (1.0 + 2.0 * self.p[P_MIC]);
         }
-        let mut bolts = std::mem::take(&mut self.bolts);
-        for b in bolts.iter_mut() {
-            self.update_bolt(b, dt);
+        self.bridge_t -= dt;
+        if self.bridge_t <= 0.0 {
+            self.spawn_bridge();
+            self.bridge_t = self.rng.range(0.15, 0.45);
         }
-        bolts.retain(|b| b.age < b.life);
-        self.bolts = bolts;
+        for i in 0..self.bolts.len() {
+            let mut b = std::mem::replace(&mut self.bolts[i], placeholder());
+            self.update_bolt(i, &mut b, dt);
+            self.bolts[i] = b;
+        }
+        // re-strikes in channels that were hit by another leader
+        let req = std::mem::take(&mut self.restrike_req);
+        for uid in req {
+            if let Some(pos) = self.bolts.iter().position(|b| b.uid == uid) {
+                let mut b = std::mem::replace(&mut self.bolts[pos], placeholder());
+                if b.phase == Phase::Connected {
+                    self.begin_stroke(&mut b, false);
+                }
+                self.bolts[pos] = b;
+            }
+        }
+        // drop links that touch compacted or finished bolts
+        self.bolts.retain(|b| b.age < b.life);
+        let alive: Vec<(u32, bool)> = self.bolts.iter().map(|b| (b.uid, b.compacted)).collect();
+        self.links.retain(|l| {
+            let a = alive.iter().find(|x| x.0 == l.a_uid);
+            let c = alive.iter().find(|x| x.0 == l.b_uid);
+            matches!((a, c), (Some(a), Some(c)) if !a.1 && !c.1)
+        });
+        for b in self.bolts.iter_mut() {
+            b.compacted = false;
+        }
         self.emit()
     }
 
@@ -818,7 +1090,6 @@ impl Sim {
                     has_child[nd.parent as usize] = true;
                 }
             }
-            let jp = |nd: &Node| add(nd.p, mul(nd.jit, STEP * crackle));
             for (i, nd) in b.nodes.iter().enumerate() {
                 if !nd.alive || nd.parent < 0 || k >= MAX_SEGS {
                     continue;
@@ -831,29 +1102,59 @@ impl Sim {
                 if t < LUT_TMIN {
                     continue;
                 }
-                let a = jp(par);
-                let e = jp(nd);
-                let w = if nd.main { 1.0 } else { 0.6f32.powi(nd.depth.max(1) as i32) };
+                let a = add(par.p, mul(par.jit, STEP * crackle));
+                let e = add(nd.p, mul(nd.jit, STEP * crackle));
+                let w = if nd.main { 1.0 } else { 0.6f32.powi(nd.depth.max(1) as i32) } * if b.bridge { 0.8 } else { 1.0 };
                 let o = k * SEG_FLOATS;
-                let out = &mut self.out[o..o + SEG_FLOATS];
-                out[0] = a[0];
-                out[1] = a[1];
-                out[2] = a[2];
-                out[3] = e[0];
-                out[4] = e[1];
-                out[5] = e[2];
-                out[6] = t;
-                out[7] = if has_child[i] { w } else { -w };
-                let li = (((t - LUT_TMIN) / (LUT_TMAX - LUT_TMIN)) * (LUT_N - 1) as f32) as usize;
-                let lum = self.lut[li.min(LUT_N - 1) * 4 + 3] * w * STEP;
+                self.out[o..o + 3].copy_from_slice(&a);
+                self.out[o + 3..o + 6].copy_from_slice(&e);
+                self.out[o + 6] = t;
+                self.out[o + 7] = if has_child[i] { w } else { -w };
+                let li = (((t - LUT_TMIN) / (LUT_TMAX - LUT_TMIN)) * (LUT_N - 1) as f32).clamp(0.0, (LUT_N - 1) as f32) as usize;
+                let lum = self.lut[li * 4 + 3] * w * STEP;
                 act += lum;
                 c = add(c, mul(e, lum));
                 tmax = tmax.max(t);
                 k += 1;
             }
         }
+        // links: junctions where one channel attached to another
+        for l in self.links.iter() {
+            if k >= MAX_SEGS {
+                break;
+            }
+            let a = self.bolts.iter().find(|b| b.uid == l.a_uid);
+            let bb = self.bolts.iter().find(|b| b.uid == l.b_uid);
+            if let (Some(a), Some(bb)) = (a, bb) {
+                if l.a_idx >= a.nodes.len() || l.b_idx >= bb.nodes.len() {
+                    continue;
+                }
+                let (na, nb) = (a.nodes[l.a_idx], bb.nodes[l.b_idx]);
+                if !na.alive || !nb.alive || len(sub(na.p, nb.p)) > STEP * 4.0 {
+                    continue;
+                }
+                let t = na.temp.min(nb.temp);
+                if t < LUT_TMIN {
+                    continue;
+                }
+                let o = k * SEG_FLOATS;
+                self.out[o..o + 3].copy_from_slice(&na.p);
+                self.out[o + 3..o + 6].copy_from_slice(&nb.p);
+                self.out[o + 6] = t;
+                self.out[o + 7] = 0.9;
+                k += 1;
+            }
+        }
         if act > 0.0 {
             c = mul(c, 1.0 / act);
+        }
+        for (i, bl) in self.blobs.iter().enumerate() {
+            let o = i * 8;
+            self.blob_out[o..o + 3].copy_from_slice(&bl.p);
+            self.blob_out[o + 3] = bl.a;
+            self.blob_out[o + 4] = bl.temp;
+            self.blob_out[o + 5] = bl.q.signum();
+            self.blob_out[o + 6] = len(bl.v);
         }
         self.info[0] = self.strikes as f32;
         self.info[1] = self.restrikes as f32;
@@ -866,7 +1167,10 @@ impl Sim {
         self.info[8] = self.strike_pos[0];
         self.info[9] = self.strike_pos[1];
         self.info[10] = self.strike_pos[2];
-        self.info[11] = HALF;
+        self.info[11] = self.blobs.len() as f32;
+        self.info[12] = self.tip_field;
+        self.info[13] = self.fn_j;
+        self.info[14] = self.links.len() as f32;
         k as u32
     }
 }
@@ -874,20 +1178,45 @@ impl Sim {
 // ---------------------------------------------------------------- exports
 #[no_mangle]
 pub extern "C" fn init(seed: u32) {
-    let keep = unsafe { SIM.as_ref().map(|s| s.p) };
+    let keep = unsafe { SIM.as_ref().map(|s| (s.p, s.half)) };
     let mut s = Sim::new(seed);
-    if let Some(p) = keep {
+    if let Some((p, h)) = keep {
         s.p = p;
+        s.half = h;
     }
     unsafe { SIM = Some(s) }
+}
+/// Chamber half-extents (m). Contents are rescaled when the window changes shape.
+#[no_mangle]
+pub extern "C" fn set_box(hx: f32, hy: f32, hz: f32) {
+    let s = sim();
+    let nh = [hx.max(100.0), hy.max(100.0), hz.max(100.0)];
+    if (0..3).any(|i| (nh[i] - s.half[i]).abs() > 0.5) {
+        let sc = [nh[0] / s.half[0], nh[1] / s.half[1], nh[2] / s.half[2]];
+        for b in s.bolts.iter_mut() {
+            for n in b.nodes.iter_mut() {
+                for i in 0..3 {
+                    n.p[i] *= sc[i];
+                }
+            }
+        }
+        for bl in s.blobs.iter_mut() {
+            for i in 0..3 {
+                bl.p[i] *= sc[i];
+            }
+        }
+        s.half = nh;
+    }
 }
 #[no_mangle]
 pub extern "C" fn strike() {
     let s = sim();
-    if s.bolts.len() >= MAX_BOLTS {
-        s.bolts.remove(0);
+    if s.bolts.iter().filter(|b| !b.bridge).count() >= MAX_BOLTS {
+        if let Some(i) = s.bolts.iter().position(|b| !b.bridge) {
+            s.bolts.remove(i);
+        }
     }
-    s.spawn_bolt();
+    s.spawn_main();
 }
 #[no_mangle]
 pub extern "C" fn set_param(id: u32, v: f32) {
@@ -904,10 +1233,13 @@ pub extern "C" fn seg_ptr() -> *const f32 {
     sim().out.as_ptr()
 }
 #[no_mangle]
+pub extern "C" fn blob_ptr() -> *const f32 {
+    sim().blob_out.as_ptr()
+}
+#[no_mangle]
 pub extern "C" fn info_ptr() -> *const f32 {
     sim().info.as_ptr()
 }
-/// LUT: LUT_N × [r, g, b (chromaticity, max 1), perceived brightness (1 at 30 000 K)]
 #[no_mangle]
 pub extern "C" fn lut_ptr() -> *const f32 {
     sim().lut.as_ptr()
@@ -923,4 +1255,20 @@ pub extern "C" fn lut_tmin() -> f32 {
 #[no_mangle]
 pub extern "C" fn lut_tmax() -> f32 {
     LUT_TMAX
+}
+#[no_mangle]
+pub extern "C" fn bb_ptr() -> *const f32 {
+    sim().bb_lut.as_ptr()
+}
+#[no_mangle]
+pub extern "C" fn bb_len() -> u32 {
+    BB_N as u32
+}
+#[no_mangle]
+pub extern "C" fn bb_tmin() -> f32 {
+    BB_TMIN
+}
+#[no_mangle]
+pub extern "C" fn bb_tmax() -> f32 {
+    BB_TMAX
 }

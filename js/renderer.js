@@ -1,7 +1,14 @@
-// WebGL2 3-D HDR renderer: instanced lightning channel segments (perspective, world-space
-// width) drawn as a Gaussian plasma channel or a shaded liquid tube, with Rayleigh/Mie
-// atmospheric extinction by distance, dual-filter bloom and ACES tone mapping.
-import { perspective, lookAt, mul } from './math.js';
+// WebGL2 HDR renderer for the glass lightning chamber.
+//
+//  * Off-axis ("window") projection (Kooima's generalised perspective): the front glass of
+//    the chamber is mapped exactly onto the screen for any eye position → the screen is
+//    the glass, the scene sits behind it with correct parallax.
+//  * Chamber: ray-traced inner walls (glass tint, edges, light from discharges and lava).
+//  * Lava blobs: sphere impostors glowing with black-body colour.
+//  * Lightning: instanced channel segments with a Gaussian cross-section, plus their mirror
+//    images in the five walls (method of images), weighted by the Fresnel reflectance of
+//    glass (Schlick, n = 1.5) and clipped to the wall where the reflected ray really lands.
+//  * Dual-filter bloom, ACES tone mapping.
 
 const FS_TRI = `#version 300 es
 out vec2 v_uv;
@@ -10,12 +17,13 @@ void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); v_uv=p; gl_Positi
 const ARC_VS = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 a_p0; layout(location=1) in vec3 a_p1; layout(location=2) in vec2 a_tw;
-uniform mat4 u_vp; uniform vec2 u_res; uniform float u_proj11; uniform float u_width; uniform float u_minPx; uniform float u_overlap;
-uniform vec3 u_cam; uniform vec3 u_ext;
-out float v_across; out float v_T; out float v_gain; out float v_along; flat out float v_L; flat out float v_hw; flat out float v_cap; flat out vec2 v_nrm; out vec3 v_trans;
+uniform mat4 u_vp; uniform mat4 u_model; uniform vec2 u_res; uniform float u_pxPerM; uniform float u_width; uniform float u_minPx;
+uniform vec3 u_eye;
+out float v_across; out float v_T; out float v_gain; out float v_along; flat out float v_L; flat out float v_hw; flat out float v_cap; out vec3 v_world;
 void main(){
   int id = gl_VertexID; float side = (id&1)==0 ? -1.0 : 1.0; bool e0 = id<2;
-  vec4 c0 = u_vp*vec4(a_p0,1.0), c1 = u_vp*vec4(a_p1,1.0);
+  vec3 w0 = (u_model*vec4(a_p0,1.0)).xyz, w1 = (u_model*vec4(a_p1,1.0)).xyz;
+  vec4 c0 = u_vp*vec4(w0,1.0), c1 = u_vp*vec4(w1,1.0);
   const float near = 5.0;
   if(c0.w<near && c1.w<near){ gl_Position=vec4(2.0,2.0,2.0,1.0); return; }
   if(c0.w<near) c0 = mix(c0,c1,(near-c0.w)/(c1.w-c0.w));
@@ -24,55 +32,139 @@ void main(){
   vec2 d = s1-s0; float L = length(d); vec2 dir = L>1e-4 ? d/L : vec2(1,0); vec2 n = vec2(-dir.y,dir.x);
   vec4 c = e0 ? c0 : c1;
   float cap = a_tw.y < 0.0 ? 1.0 : 0.0;
-  float wTrue = u_width*abs(a_tw.y)*u_proj11*0.5*u_res.y/c.w;   // world metres → pixels
+  float wTrue = u_width*abs(a_tw.y)*u_pxPerM/c.w;     // metres → pixels at this depth
   float wpx = max(wTrue, u_minPx);
   v_gain = wTrue/wpx;
-  float j = u_overlap*wpx;
-  float ext = (!e0 && cap > 0.5) ? wpx*1.2 : j;
-  vec2 off = n*side*wpx*0.5 + dir*(e0 ? -j : ext);
+  float ext = (!e0 && cap > 0.5) ? wpx*1.2 : 0.0;
+  vec2 off = n*side*wpx*0.5 + dir*(e0 ? 0.0 : ext);
   c.xy += off/(0.5*u_res)*c.w;
   gl_Position = c;
-  v_across = side; v_T = a_tw.x; v_along = e0 ? -j : L+ext; v_L = L; v_hw = wpx*0.5; v_cap = cap;
-  v_nrm = vec2(n.x, -n.y);   // screen y down for shading ("up" = toward top of screen)
-  // Beer–Lambert extinction along the line of sight (Rayleigh ∝ λ⁻⁴ + Mie haze)
-  float dist = length((e0 ? a_p0 : a_p1) - u_cam);
-  v_trans = exp(-u_ext*dist);
+  v_across = side; v_T = a_tw.x; v_along = e0 ? 0.0 : L+ext; v_L = L; v_hw = wpx*0.5; v_cap = cap;
+  v_world = e0 ? w0 : w1;
 }`;
 const ARC_FS = `#version 300 es
 precision highp float;
-in float v_across; in float v_T; in float v_gain; in float v_along; flat in float v_L; flat in float v_hw; flat in float v_cap; flat in vec2 v_nrm; in vec3 v_trans;
+in float v_across; in float v_T; in float v_gain; in float v_along; flat in float v_L; flat in float v_hw; flat in float v_cap; in vec3 v_world;
 out vec4 o;
-uniform sampler2D u_lut; uniform vec2 u_lutRange; uniform float u_gain, u_sharp, u_time; uniform int u_style;
+uniform sampler2D u_lut; uniform vec2 u_lutRange; uniform float u_gain, u_sharp;
+uniform vec3 u_eye; uniform vec3 u_half;
+uniform vec4 u_plane;    // mirror plane n·x = d (n = 0 → direct view)
+uniform float u_reflect; // reflectance multiplier (1 = clean glass)
 void main(){
+  float R = 1.0;
+  if(dot(u_plane.xyz,u_plane.xyz) > 0.0){
+    // where does the eye→virtual-image ray cross the wall? keep only hits on the wall itself
+    vec3 dir = v_world - u_eye;
+    float den = dot(u_plane.xyz, dir);
+    float t = (u_plane.w - dot(u_plane.xyz, u_eye)) / den;
+    vec3 hit = u_eye + dir*t;
+    vec3 a = abs(hit) - u_half*1.001;
+    vec3 m = vec3(1.0) - abs(u_plane.xyz);
+    if(t <= 0.0 || t >= 1.0 || max(max(a.x*m.x, a.y*m.y), a.z*m.z) > 0.0) discard;
+    // Fresnel reflectance of glass (Schlick): R0 = ((n−1)/(n+1))² = 0.04
+    float c = abs(dot(normalize(dir), u_plane.xyz));
+    R = (0.04 + 0.96*pow(1.0 - c, 5.0)) * u_reflect;
+  }
   vec4 lut = texture(u_lut, vec2(clamp((v_T-u_lutRange.x)/(u_lutRange.y-u_lutRange.x),0.0,1.0),0.5));
-  vec3 c = lut.rgb; float B = lut.a;                // spectral colour + perceived brightness
   float dEnd = v_cap > 0.5 ? max(v_along - v_L, 0.0)/max(v_hw,1e-3) : 0.0;
-  if(u_style == 0){
-    float g = exp(-v_across*v_across*u_sharp) * exp(-dEnd*dEnd*u_sharp);
-    o = vec4(c*B*g*v_gain*u_gain*v_trans, 1.0);
-    return;
+  float g = exp(-v_across*v_across*u_sharp) * exp(-dEnd*dEnd*u_sharp);
+  o = vec4(lut.rgb*lut.a*g*v_gain*u_gain*R, 1.0);
+}`;
+
+const CHAMBER_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform vec3 u_eye; uniform vec3 u_half; uniform float u_time;
+uniform vec4 u_light; uniform vec3 u_lcol;     // discharge: xyz centroid, w strength
+uniform vec4 u_blobs[12]; uniform vec4 u_bcol[12]; uniform int u_nb;
+float hash(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+float vnoise(vec3 p){ vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z); }
+float fbm(vec3 p){ float s=0.0,a=0.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*2.02+vec3(3.1,1.7,5.3); a*=0.5; } return s; }
+vec3 lightAt(vec3 p, vec3 n){
+  vec3 L = u_light.xyz - p; float r2 = dot(L,L);
+  vec3 e = u_lcol*u_light.w*max(dot(normalize(L),n),0.0)*6.0e5/(r2+4.0e4);
+  for(int i=0;i<12;i++){ if(i>=u_nb) break;
+    vec3 B = u_blobs[i].xyz - p; float b2 = dot(B,B);
+    e += u_bcol[i].rgb*u_bcol[i].a*max(dot(normalize(B),n),0.0)*u_blobs[i].w*u_blobs[i].w*0.8/(b2+1.0e4);
   }
-  float r = sqrt(v_across*v_across + dEnd*dEnd);
-  if(r >= 1.0) discard;
-  float nz = sqrt(1.0 - r*r);
-  float vis = smoothstep(0.02, 0.12, B);
-  float shift = 0.25*sin(u_time*1.7 + dot(gl_FragCoord.xy, vec2(0.006, 0.009)));
-  vec2 N2 = v_nrm * v_across;
-  float up = -N2.y;
-  vec3 col;
-  if(u_style == 1){
-    float env = mix(0.04, 0.95, smoothstep(-0.10, 0.30, up + shift*0.3));
-    float horizon = 0.9*exp(-pow((up - 0.06 - shift*0.2)/0.05, 2.0));
-    float spec = 1.6*pow(max(0.0, 1.0 - length(vec2(N2.x + 0.25, up - 0.45))*2.2), 3.0);
-    float refl = (env*(0.45 + 0.55*nz) + horizon) * (0.35 + 0.65*pow(1.0 - nz, 0.35)) + spec + 0.05;
-    col = mix(vec3(0.80,0.83,0.90), c, 0.3) * refl + c*B*0.4*nz;
-  } else {
-    float fres = pow(1.0 - nz, 3.0);
-    float spec = 1.4*pow(max(0.0, 1.0 - length(vec2(N2.x + 0.3, up - 0.4))*2.5), 3.0);
-    col = vec3(0.06,0.25,0.45)*(0.3 + 0.7*smoothstep(-0.5, 0.6, up)) + vec3(0.55,0.85,1.0)*fres*1.4 + vec3(spec) + c*B*0.3;
+  return e;
+}
+void main(){
+  // point on the front glass (the screen) and the view ray through it
+  vec3 P = vec3(mix(-u_half.x,u_half.x,v_uv.x), mix(-u_half.y,u_half.y,v_uv.y), u_half.z);
+  vec3 d = normalize(P - u_eye);
+  // exit point through the inner walls of the box
+  vec3 tq = (sign(d)*u_half - P)/d;
+  float t = min(min(d.x!=0.0?tq.x:1e9, d.y!=0.0?tq.y:1e9), d.z!=0.0?tq.z:1e9);
+  vec3 H = P + d*t;
+  vec3 n; vec2 uv;
+  vec3 ah = abs(H)/u_half;
+  if(t == tq.x){ n = vec3(-sign(d.x),0,0); uv = H.zy; }
+  else if(t == tq.y){ n = vec3(0,-sign(d.y),0); uv = H.xz; }
+  else { n = vec3(0,0,1); uv = H.xy; }
+  // glass wall: very dark tint + a slowly evolving surreal haze, lit by lightning and lava
+  float haze = fbm(vec3(uv*0.0016, u_time*0.03)) ;
+  float warp = fbm(vec3(uv*0.0011 + haze*1.7, u_time*0.02 + 7.0));
+  vec3 base = mix(vec3(0.002,0.002,0.005), vec3(0.008,0.004,0.012), warp) * (0.5 + 0.8*haze);
+  vec3 E = lightAt(H, n);
+  vec3 col = base + E*(0.008 + 0.02*warp*warp);
+  // edges of the chamber (where two walls meet): thin glass edges catching light
+  vec3 q = vec3(1.0) - ah;
+  float e1 = min(min(q.x + q.y*10.0*float(ah.y<0.0), 9.0), 9.0);
+  float edge = 0.0;
+  vec3 qq = q * u_half;   // distance to each wall (m)
+  float m1 = min(qq.x, qq.y), m2 = min(qq.y, qq.z), m3 = min(qq.x, qq.z);
+  float de = min(min(max(qq.x,qq.y), max(qq.y,qq.z)), max(qq.x,qq.z));
+  edge = exp(-de/6.0);
+  col += (vec3(0.025,0.03,0.04) + E*0.08) * edge;
+  // volumetric glow of the air between the glass and the wall (single scattering, crude)
+  vec3 mid = P + d*t*0.5;
+  col += lightAt(mid, normalize(u_light.xyz - mid))*0.0015*t/1000.0;
+  // front glass: faint Fresnel sheen + reflection streak
+  float cosv = abs(d.z);
+  float Rf = 0.04 + 0.96*pow(1.0 - cosv, 5.0);
+  float streak = smoothstep(0.35, 0.0, abs((v_uv.x - v_uv.y*0.6) - 0.25 - 0.05*sin(u_time*0.1)))*0.012;
+  col += vec3(0.6,0.65,0.8)*(Rf*0.04 + streak);
+  o = vec4(col, 1.0);
+}`;
+
+const BLOB_VS = `#version 300 es
+precision highp float;
+uniform mat4 u_vp; uniform vec4 u_blob; uniform vec3 u_right; uniform vec3 u_up; uniform float u_scale;
+out vec2 v_q;
+void main(){
+  vec2 q = vec2(float(gl_VertexID&1), float((gl_VertexID>>1)&1))*2.0-1.0;
+  v_q = q*u_scale;
+  vec3 p = u_blob.xyz + (u_right*q.x + u_up*q.y)*u_blob.w*u_scale;
+  gl_Position = u_vp*vec4(p,1.0);
+}`;
+const BLOB_FS = `#version 300 es
+precision highp float;
+in vec2 v_q; out vec4 o; uniform vec4 u_col; uniform float u_time; uniform float u_seed;
+float hash(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+float vnoise(vec3 p){ vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z); }
+void main(){
+  float r = length(v_q);
+  vec3 c = u_col.rgb*u_col.a;
+  vec3 col = vec3(0);
+  if(r < 1.0){
+    float nz = sqrt(1.0 - r*r);
+    vec3 nrm = vec3(v_q, nz);
+    // molten surface: convecting noise on the sphere, hotter (brighter) cells and darker crust
+    vec3 sp = nrm*2.3 + vec3(u_seed, u_seed*0.7, u_time*0.12);
+    float cell = vnoise(sp) * 0.65 + vnoise(sp*2.7 + 3.1) * 0.35;
+    float heat = mix(0.55, 1.25, smoothstep(0.25, 0.8, cell));
+    // limb darkening of an emitting sphere, plus a soft Fresnel rim from the fluid
+    col = c * heat * (0.35 + 0.65*pow(nz, 0.7));
+    col += c * pow(1.0 - nz, 3.0) * 0.4;
+    col *= smoothstep(1.0, 0.95, r);
   }
-  float aa = smoothstep(1.0, 0.82, r);
-  o = vec4(col*aa*vis*u_gain*v_trans, 1.0);
+  col += c*exp(-max(r-0.85,0.0)*3.0)*0.12*step(0.95, r);   // glow scattered by the fluid
+  o = vec4(col, 1.0);
 }`;
 const DOWN_FS = `#version 300 es
 precision highp float;
@@ -99,17 +191,12 @@ void main(){
 const COMP_FS = `#version 300 es
 precision highp float;
 in vec2 v_uv; out vec4 o;
-uniform sampler2D u_hdr, u_bloom; uniform float u_bloomK, u_time, u_aspect;
-uniform vec3 u_room; uniform vec2 u_lightPos;
+uniform sampler2D u_hdr, u_bloom; uniform float u_bloomK, u_time;
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
 vec3 srgb(vec3 c){ return mix(c*12.92, 1.055*pow(c,vec3(1.0/2.4))-0.055, step(0.0031308,c)); }
 void main(){
-  vec3 h = texture(u_hdr,v_uv).rgb;
-  vec3 b = texture(u_bloom,v_uv).rgb;
-  // light scattered by the surrounding cloud air, centred on the discharge
-  vec2 dv = (v_uv - u_lightPos)*vec2(u_aspect,1.0);
-  vec3 bg = vec3(0.003,0.004,0.008) + u_room/(1.0 + dot(dv,dv)*4.0);
-  vec3 c = srgb(aces(h + b*(u_bloomK/6.0) + bg));
+  vec3 c = srgb(aces(texture(u_hdr,v_uv).rgb + texture(u_bloom,v_uv).rgb*(u_bloomK/6.0)));
+  vec2 q = v_uv - 0.5; c *= 1.0 - dot(q,q)*0.35;
   float n = fract(sin(dot(gl_FragCoord.xy+u_time, vec2(12.9898,78.233)))*43758.5453);
   o = vec4(c + (n-0.5)/255.0, 1.0);
 }`;
@@ -128,9 +215,18 @@ function compile(gl, vs, fs) {
   const u = {};
   for (let i = 0, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i < n; i++) {
     const info = gl.getActiveUniform(p, i);
-    u[info.name] = gl.getUniformLocation(p, info.name);
+    u[info.name.replace(/\[0\]$/, '')] = gl.getUniformLocation(p, info.name);
   }
   return { p, u };
+}
+
+const IDENT = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+/** Reflection across the plane axis = ±half (column-major). */
+function mirror(axis, d) {
+  const m = new Float32Array(IDENT);
+  m[axis * 5] = -1;
+  m[12 + axis] = 2 * d;
+  return m;
 }
 
 export class Renderer {
@@ -143,6 +239,8 @@ export class Renderer {
     gl.getExtension('OES_texture_float_linear');
     this.fmt = floatOK ? { i: gl.RGBA16F, t: gl.HALF_FLOAT } : { i: gl.RGBA8, t: gl.UNSIGNED_BYTE };
     this.arc = compile(gl, ARC_VS, ARC_FS);
+    this.chamber = compile(gl, FS_TRI, CHAMBER_FS);
+    this.blob = compile(gl, BLOB_VS, BLOB_FS);
     this.down = compile(gl, FS_TRI, DOWN_FS);
     this.up = compile(gl, FS_TRI, UP_FS);
     this.comp = compile(gl, FS_TRI, COMP_FS);
@@ -151,7 +249,7 @@ export class Renderer {
     this.arcBuf = gl.createBuffer();
     gl.bindVertexArray(this.arcVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.arcBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, 4 * 8 * 50000, gl.DYNAMIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, 4 * 8 * 60000, gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(0, 1);
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12); gl.vertexAttribDivisor(1, 1);
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 32, 24); gl.vertexAttribDivisor(2, 1);
@@ -160,7 +258,6 @@ export class Renderer {
     this.scale = 1; this.w = this.h = 0;
   }
 
-  /** data: n × [r,g,b,brightness] */
   setLUT(data, n, tmin, tmax) {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
@@ -172,10 +269,10 @@ export class Renderer {
     this.lutRange = [tmin, tmax];
     this.lut = { data, n, tmin, tmax };
   }
-  colorAt(T) {
-    const { data, n, tmin, tmax } = this.lut;
-    const i = Math.round(Math.min(1, Math.max(0, (T - tmin) / (tmax - tmin))) * (n - 1));
-    return [data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]];
+  setBlackbody(data, n, tmin, tmax) { this.bb = { data, n, tmin, tmax }; }
+  static sample(t, T) {
+    const i = Math.round(Math.min(1, Math.max(0, (T - t.tmin) / (t.tmax - t.tmin))) * (t.n - 1));
+    return [t.data[i * 4], t.data[i * 4 + 1], t.data[i * 4 + 2], t.data[i * 4 + 3]];
   }
 
   _tex(w, h) {
@@ -208,57 +305,106 @@ export class Renderer {
         mw = Math.max(1, mw >> 1); mh = Math.max(1, mh >> 1);
       }
     }
-    this.dpr = dpr;
     return [w, h];
   }
 
-  camera(eye, target, fov) {
-    const proj = perspective(fov, this.w / this.h, 5, 60000);
-    return { proj, vp: mul(proj, lookAt(eye, target, [0, 1, 0])) };
+  /**
+   * Off-axis projection with the front glass (z = half.z, |x| ≤ hx, |y| ≤ hy) as the screen.
+   * view = translate(−eye) (the screen is axis-aligned), proj = frustum(l, r, b, t).
+   */
+  windowCamera(eye, half) {
+    const n = 5, f = 60000;
+    const dist = eye[2] - half[2];
+    const k = n / dist;
+    const l = (-half[0] - eye[0]) * k, r = (half[0] - eye[0]) * k;
+    const b = (-half[1] - eye[1]) * k, t = (half[1] - eye[1]) * k;
+    const P = new Float32Array(16);
+    P[0] = 2 * n / (r - l); P[5] = 2 * n / (t - b);
+    P[8] = (r + l) / (r - l); P[9] = (t + b) / (t - b); P[10] = -(f + n) / (f - n); P[11] = -1;
+    P[14] = -2 * f * n / (f - n);
+    const vp = new Float32Array(P);
+    // vp = P · translate(−eye)
+    for (let r2 = 0; r2 < 4; r2++) vp[12 + r2] = P[r2] * -eye[0] + P[4 + r2] * -eye[1] + P[8 + r2] * -eye[2] + P[12 + r2];
+    // pixels per metre at depth w = 1 (width scaling in the vertex shader)
+    const pxPerM = this.h / (half[1] * 2) * dist;
+    return { vp, pxPerM };
   }
 
   render(s) {
     const gl = this.gl, { w, h } = this, hdr = this.targets[0];
-    const { proj, vp } = s.cam;
+    const { vp, pxPerM } = s.cam;
     gl.bindFramebuffer(gl.FRAMEBUFFER, hdr.fbo);
     gl.viewport(0, 0, w, h);
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.BLEND);
+    gl.bindVertexArray(this.emptyVao);
+
+    // 1) glass chamber
+    let p = this.chamber;
+    gl.useProgram(p.p);
+    gl.uniform3fv(p.u.u_eye, s.eye);
+    gl.uniform3fv(p.u.u_half, s.half);
+    gl.uniform1f(p.u.u_time, s.time);
+    gl.uniform4fv(p.u.u_light, s.light);
+    gl.uniform3fv(p.u.u_lcol, s.lightColor);
+    gl.uniform4fv(p.u.u_blobs, s.blobPos);
+    gl.uniform4fv(p.u.u_bcol, s.blobCol);
+    gl.uniform1i(p.u.u_nb, s.nBlobs);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
+
+    // 2) lava blobs
+    p = this.blob;
+    gl.useProgram(p.p);
+    gl.uniformMatrix4fv(p.u.u_vp, false, vp);
+    gl.uniform3f(p.u.u_right, 1, 0, 0);
+    gl.uniform3f(p.u.u_up, 0, 1, 0);
+    gl.uniform1f(p.u.u_scale, 1.6);
+    gl.uniform1f(p.u.u_time, s.time);
+    for (let i = 0; i < s.nBlobs; i++) {
+      gl.uniform4f(p.u.u_blob, s.blobPos[i * 4], s.blobPos[i * 4 + 1], s.blobPos[i * 4 + 2], s.blobPos[i * 4 + 3]);
+      gl.uniform4f(p.u.u_col, s.blobCol[i * 4], s.blobCol[i * 4 + 1], s.blobCol[i * 4 + 2], s.blobCol[i * 4 + 3] * s.lava);
+      gl.uniform1f(p.u.u_seed, i * 1.7);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    // 3) lightning + its reflections in the five glass walls
     if (s.segCount > 0) {
       gl.bindVertexArray(this.arcVao);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.arcBuf);
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, s.segs, 0, s.segCount * 8);
-      const p = this.arc;
+      p = this.arc;
       gl.useProgram(p.p);
       gl.uniformMatrix4fv(p.u.u_vp, false, vp);
       gl.uniform2f(p.u.u_res, w, h);
-      gl.uniform1f(p.u.u_proj11, proj[5]);
-      gl.uniform3fv(p.u.u_cam, s.eye);
-      gl.uniform3fv(p.u.u_ext, s.extinction);
-      gl.uniform1f(p.u.u_time, s.time);
+      gl.uniform1f(p.u.u_pxPerM, pxPerM);
+      gl.uniform3fv(p.u.u_eye, s.eye);
+      gl.uniform3fv(p.u.u_half, s.half);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
       gl.uniform1i(p.u.u_lut, 0);
       gl.uniform2fv(p.u.u_lutRange, this.lutRange);
-      const k = s.thickness;
-      const passes = s.style === 0
-        ? [[0, 4 * k, 1.4, 1.2, 2.2],    // hot channel core (metres)
-           [0, 28 * k, 4.0, 0.08, 2.5]]  // corona / near-field glow
-        : [[0, 40 * k, 4.0, 0.015, 2.0],
-           [s.style, 16 * k, 3.0, 1.0, 0]];
-      for (const [style, wd, mp, g, sh] of passes) {
-        gl.blendEquation(style === 0 ? gl.FUNC_ADD : gl.MAX);
-        gl.uniform1i(p.u.u_style, style);
-        gl.uniform1f(p.u.u_overlap, style === 0 ? 0.0 : 0.3);
-        gl.uniform1f(p.u.u_width, wd); gl.uniform1f(p.u.u_minPx, mp);
-        gl.uniform1f(p.u.u_gain, g * s.gain); gl.uniform1f(p.u.u_sharp, sh);
-        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, s.segCount);
+      const H = s.half;
+      const views = [[IDENT, [0, 0, 0, 0]]];
+      if (s.reflect > 0) {
+        views.push([mirror(0, H[0]), [1, 0, 0, H[0]]], [mirror(0, -H[0]), [-1, 0, 0, H[0]]],
+          [mirror(1, H[1]), [0, 1, 0, H[1]]], [mirror(1, -H[1]), [0, -1, 0, H[1]]], [mirror(2, -H[2]), [0, 0, -1, H[2]]]);
       }
-      gl.blendEquation(gl.FUNC_ADD);
+      const k = s.thickness;
+      for (const [model, plane] of views) {
+        gl.uniformMatrix4fv(p.u.u_model, false, model);
+        gl.uniform4fv(p.u.u_plane, plane);
+        gl.uniform1f(p.u.u_reflect, s.reflect);
+        for (const [wd, mp, g, sh] of [[5 * k, 1.5, 1.3, 2.2], [32 * k, 4.0, 0.08, 2.5]]) {
+          gl.uniform1f(p.u.u_width, wd); gl.uniform1f(p.u.u_minPx, mp);
+          gl.uniform1f(p.u.u_gain, g * s.gain); gl.uniform1f(p.u.u_sharp, sh);
+          gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, s.segCount);
+        }
+      }
     }
-    // bloom
+
+    // 4) bloom
     gl.disable(gl.BLEND);
     gl.bindVertexArray(this.emptyVao);
     gl.useProgram(this.down.p);
@@ -290,9 +436,6 @@ export class Renderer {
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.targets[1].tex); gl.uniform1i(c.u.u_bloom, 1);
     gl.uniform1f(c.u.u_bloomK, s.bloom);
     gl.uniform1f(c.u.u_time, s.time);
-    gl.uniform1f(c.u.u_aspect, w / h);
-    gl.uniform3f(c.u.u_room, s.room[0], s.room[1], s.room[2]);
-    gl.uniform2f(c.u.u_lightPos, s.lightPos[0], s.lightPos[1]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.activeTexture(gl.TEXTURE0);
   }

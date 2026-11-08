@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <title>Lightning Machine</title>
-<meta name="description" content="3-D liquid lightning: stepped leaders grow through a real electric field, return strokes follow the Heidler/MTLE current model, channels fold in an ABC fluid flow, and colour comes from the air-plasma emission spectrum. Rust/WebAssembly + WebGL2.">
+<meta name="description" content="Clean lightning in a glass chamber: 3-D stepped leaders with quantum (Fowler–Nordheim) tunnelling, channels that connect to each other, Heidler/MTLE return strokes, air-plasma spectral colour, Fresnel glass reflections, lava-lamp convection. Rust/WebAssembly + WebGL2.">
 <meta name="theme-color" content="#000000">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -21,14 +21,9 @@
 
 <aside id="panel">
   <header><b>⚡ Controller</b><button id="btn-close" title="Hide (Esc)">✕</button></header>
-  <div id="modes">
-    <button data-mode="0" title="1">Lightning</button>
-    <button data-mode="1" title="2">Liquid metal</button>
-    <button data-mode="2" title="3">Water</button>
-  </div>
-  <div class="tb"><canvas id="tbar"></canvas><span>1 500 K</span><span>channel emission colour</span><span>40 000 K</span></div>
+  <div class="tb"><canvas id="tbar"></canvas><span>1 500 K</span><span>lightning (air-plasma spectrum)</span><span>40 000 K</span></div>
   <div id="controls"></div>
-  <p class="hint">Drag to rotate · scroll / pinch to zoom · tap to strike. Controls hide automatically.<br>Keys: Space strike · H panel · F fullscreen · S sound · M mic · 1-3 looks</p>
+  <p class="hint">The screen is the glass of the chamber. Drag to look around inside · tap to strike. Controls hide automatically.<br>Keys: Space strike · H panel · F fullscreen · S sound · M mic</p>
 </aside>
 <script type="module" src="js/app.js"></script>
 </body>

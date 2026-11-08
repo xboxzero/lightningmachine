@@ -1,28 +1,28 @@
-# ⚡ Lightning Machine — 3-D liquid lightning
+# ⚡ Lightning Machine — lightning in a glass chamber
 
 Live: **https://xboxzero.github.io/lightningmachine/**
 
-Real-time lightning inside a 2 km block of thundercloud, shown in 3D. Rotate around it, zoom in, and watch the bolts grow, strike, re-strike and keep folding through the air like a liquid.
+Your screen is the front glass of a dark chamber. Inside, real-physics lightning grows, strikes, re-strikes, links up with neighbouring bolts, and slowly folds around in 3D on a lava-lamp-style convection flow. The viewpoint drifts on its own, and the perspective is always corrected so the screen behaves like a window into the box.
 
-## The physics (Rust → WebAssembly, `core/src/lib.rs`)
+## Physics and maths (Rust → WebAssembly, `core/src/lib.rs`)
 | | Model |
 |---|---|
-| **Charge** | Thundercloud *tripole*: a main negative layer, an upper positive layer and a lower positive region. Each charge is a softened point charge (Coulomb's law). |
-| **Stepped leader** | 3-D stochastic dielectric breakdown. At each step the leader tries several directions and picks one with probability ∝ (d̂·Ê)^η · e^{σN}. Negative leaders move along −E toward positive charge and fork at random. |
-| **Return stroke** | Heidler current function (IEC 62305-1: 1/200 µs first stroke, 0.25/100 µs later strokes). It travels along the channel by the MTLE model at v = 1.2×10⁸ m/s with λ = 2 km. Peak currents follow the CIGRE log-normal statistics. Re-strikes and continuing current are included. |
-| **Temperature** | T = 4000 + 26000·(I/30 kA)^0.12. Peak stroke temperatures stay near 28–31 kK, matching spectroscopy (Orville 1968). The channel cools toward the continuing-current equilibrium. |
-| **Colour** | The air-plasma emission spectrum: N II, O II, N I, O I, Hα, Hβ, Hγ lines weighted by Boltzmann excitation e^{−E_u/kT} and the Saha ionisation balance of nitrogen, plus a recombination/bremsstrahlung continuum ∝ x². This is integrated against the CIE 1931 colour tables → sRGB. The result runs from a blue-violet-white flash, through pink and violet, to red as the channel cools. |
-| **Brightness** | Fechner's law (perceived brightness is logarithmic) across 7 decades of luminance. |
-| **Atmosphere** | Beer–Lambert extinction with Rayleigh (∝ λ⁻⁴) plus haze coefficients, so distant channels look warmer. |
-| **Liquid motion** | Arnold–Beltrami–Childress (ABC) flow, an exact divergence-free solution of the Euler equations, with drifting phases. Channels are moved by RK2 integration and re-sampled as they stretch, with a surface-tension-like smoothing term. |
+| **Charge cells** | Invisible buoyant cells, heated at the floor and cooled at the ceiling (Newtonian heating, Boussinesq buoyancy, Stokes drag). Their charge follows thermionic emission (Richardson–Dushman J = A T² e^{−W/kT}): hot rising cells turn positive and cold sinking cells stay negative. |
+| **Electric field** | Coulomb's law with softened charges, E = k Σ q (x − x_q)/(r² + a²)^{3/2} in V/m. |
+| **Quantum tunnelling** | Fowler–Nordheim field emission with Murphy–Good barrier functions: ln T_WKB = −v(f)·bφ^{3/2}/F, J = (a/φt²)F²T, with F = β|E|. The tunnelling probability weights every breakdown step, and J sets how fast the leader steps. |
+| **Stepped leader** | 3-D stochastic dielectric breakdown. Candidate steps are weighted by (d̂·Ê)^η × T_WKB^w × e^{σN} and one is picked by the Born rule (P ∝ \|ψ\|²). Tips fork at random. |
+| **Connections** | Leader tips attach to positive cells **or to any existing channel** (found with a spatial hash). Hot channels of different bolts that drift close together get bridging leaders. When one channel is hit by another, it re-strikes. |
+| **Return stroke** | Heidler current function (IEC 62305-1), MTLE propagation at 1.2×10⁸ m/s, CIGRE peak-current statistics, re-strikes and continuing current. Temperature T = 4000 + 26000·(I/30 kA)^0.12. |
+| **Colour** | From the colour temperature of the air plasma: N II, O II, N I, O I and H emission lines (Boltzmann excitation × Saha ionisation) plus a recombination continuum, integrated against the CIE 1931 colour tables → sRGB. The channel flashes blue-violet-white, then cools through pink-violet to red. |
+| **Flow** | Regularised Stokeslets (Cortez) dragged along by the cells, plus Rayleigh–Bénard convection rolls. The flow is divergence-free, like water. Channels are moved by RK2 integration, re-sampled as they stretch, and smoothed by a curvature term. |
+| **Glass** | Off-axis "window" projection (Kooima). Mirror images in the five walls via the method of images, clipped to each wall and weighted by glass Fresnel reflectance (Schlick, n = 1.5, R₀ = 4%). |
 
 ## Controls
 The buttons in the bottom-right corner hide after 2.5 s of no activity; move the mouse or tap to bring them back.
 - ⚡ strike · ⚙ controller · 🔈 sound · 🎤 mic · ⛶ fullscreen
-- **Drag** to rotate · **scroll / pinch** to zoom · **tap** to strike
-- **Looks:** Lightning · Liquid metal · Water
-- **Sliders:** bolts, flow speed, swirl size, smoothness, crackle, breakdown exponent η, branching, charge regions, leader speed, peak current, continuing current, re-strikes, stroke slow-motion, lifetime, air/haze, auto-rotate, brightness, thickness, volume
-- **Keys:** Space strike · H panel · F fullscreen · S sound · M mic · 1/2/3 looks
+- **Drag** to move your eye and look around inside the glass · **tap** to strike
+- **Panel sections:** Lightning · Quantum tunnelling · Chamber flow · Glass & view. Raise *Glass reflection* above 1 for a kaleidoscope-like effect.
+- **Keys:** Space strike · H panel · F fullscreen · S sound · M mic
 
 ## Build
 ```bash
