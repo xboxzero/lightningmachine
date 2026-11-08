@@ -10,7 +10,7 @@ const P = { bolts: 0, blobs: 1, heat: 2, flow: 3, eta: 4, quantum: 5, betaLog: 6
 
 let wasm, renderer;
 const sound = new Sound();
-const ui = { smoke: 1, gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 1, mist: 0.3, autoQuality: true, sway: 1, soundOn: false, micOn: false };
+const ui = { psy: 0, psyAmt: 1, kaleido: false, res: 0, snap: false, smoke: 1, gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 1, mist: 0.3, autoQuality: true, sway: 1, soundOn: false, micOn: false };
 const HY = 1000, HZ = 900, FOV = 50 * Math.PI / 180;
 const view = { dragX: 0, dragY: 0 };
 
@@ -43,6 +43,7 @@ const controls = [
   { sec: 'Chamber flow', id: 'tension', label: 'Smoothness', min: 0, max: 1, step: 0.01, v: 0.3, p: P.tension },
   { sec: 'Chamber flow', id: 'crackle', label: 'Crackle', min: 0, max: 1.5, step: 0.01, v: 0.3, p: P.crackle },
   { sec: 'Glass & view', id: 'reflect', label: 'Glass reflection (1 = real glass)', min: 0, max: 12, step: 0.1, v: 1, ui: 'reflect' },
+  { sec: 'Visual mode', id: 'psyAmt', label: 'Psychedelic intensity', min: 0.1, max: 1.5, step: 0.01, v: 1, ui: 'psyAmt' },
   { sec: 'Glass & view', id: 'sway', label: 'Automatic viewpoint drift', min: 0, max: 3, step: 0.05, v: 1, ui: 'sway' },
   { sec: 'Glass & view', id: 'gain', label: 'Brightness', min: 0.1, max: 3, step: 0.01, v: 1, ui: 'gain' },
   { sec: 'Glass & view', id: 'thickness', label: 'Thickness', min: 0.3, max: 4, step: 0.05, v: 1, ui: 'thickness' },
@@ -76,6 +77,14 @@ function buildPanel() {
     inp.addEventListener('input', apply);
     apply();
   }
+  const vm = secs['Visual mode'];
+  const sel = (html) => { const d = document.createElement('div'); d.className = 'row sel'; d.innerHTML = html; vm.insertBefore(d, vm.children[1]); return d; };
+  sel(`<span>Psychedelic mode</span><select id="sel-psy"><option value="0">Off — natural</option><option value="1">Trails &amp; colour flow</option><option value="2">Kaleidoscope</option></select>`);
+  sel(`<span>Resolution</span><select id="sel-res"><option value="0">Auto (adaptive, smooth)</option><option value="1080">1080p Full HD</option><option value="1440">1440p QHD</option><option value="2160">2160p 4K UHD</option></select>`);
+  $('#sel-psy').onchange = (e) => { ui.psy = +e.target.value; ui.kaleido = ui.psy === 2; };
+  $('#sel-res').onchange = (e) => { ui.res = +e.target.value; renderer.targetH = ui.res || 0; if (!ui.res) renderer.scale = 1; };
+  vm.parentElement.insertBefore(vm, vm.parentElement.firstChild);
+  vm.open = true;
   drawBars();
 }
 
@@ -168,6 +177,7 @@ function setupInput() {
   $('#btn-sound').onclick = toggleSound;
   $('#btn-mic').onclick = toggleMic;
   $('#btn-strike').onclick = () => wasm.strike();
+  $('#btn-snap').onclick = () => { ui.snap = true; };
 }
 
 // ---------------------------------------------------------------- frame loop
@@ -180,7 +190,7 @@ function adapt(ms) {
   ms = Math.min(ms, 250);
   perf.avg = perf.avg * 0.85 + ms * 0.15;
   perf.t += ms;
-  if (!ui.autoQuality || perf.t < 500) return;   // re-evaluate every half second
+  if (!ui.autoQuality || renderer.targetH || perf.t < 500) return;   // re-evaluate every half second
   perf.t = 0;
   const minScale = renderer.fallback ? 0.4 : 0.35;
   if (perf.avg > 20 && renderer.scale > minScale) renderer.scale = Math.max(minScale, renderer.scale * (perf.avg > 40 ? 0.7 : 0.85));
@@ -233,9 +243,22 @@ function frame(now) {
     segs: f32(wasm.seg_ptr(), Math.max(1, n) * 8), segCount: n,
     light: [info[3], info[4], info[5], act], lightColor: [lc[0], lc[1], lc[2]],
     blobPos, blobCol, nBlobs: 0, lava: 0,
+    psy: ui.psy ? ui.psyAmt : 0, kaleido: ui.kaleido,
     puffs: f32(wasm.puff_ptr(), Math.max(1, wasm.puff_count()) * 8), puffCount: wasm.puff_count(), smoke: ui.smoke,
     reflect: ui.reflect, reflections: perf.reflections, mist: ui.mist, gain: ui.gain, thickness: ui.thickness, bloom: ui.bloom,
   });
+  if (ui.snap) {
+    ui.snap = false;
+    // read back in the same task as the draw (works without preserveDrawingBuffer)
+    renderer.canvas.toBlob((b) => {
+      if (!b) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(b);
+      a.download = `lightning-${renderer.w}x${renderer.h}.png`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    }, 'image/png');
+  }
   requestAnimationFrame(frame);
 }
 

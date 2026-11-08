@@ -110,9 +110,16 @@ export class Renderer2D {
   setLUT(data, n, tmin, tmax) { this.lut = { data, n, tmin, tmax }; }
   setBlackbody(data, n, tmin, tmax) { this.bb = { data, n, tmin, tmax }; }
   resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 1) * this.scale;
-    const w = Math.max(2, Math.floor(this.canvas.clientWidth * dpr));
-    const h = Math.max(2, Math.floor(this.canvas.clientHeight * dpr));
+    let w, h;
+    if (this.targetH) {
+      // fixed internal resolution (e.g. 2160 rows = 4K UHD)
+      const aspect = Math.max(0.2, this.canvas.clientWidth / Math.max(1, this.canvas.clientHeight));
+      h = this.targetH; w = Math.round(h * aspect);
+    } else {
+      const dpr = Math.min(window.devicePixelRatio || 1, 1) * this.scale;
+      w = Math.max(2, Math.floor(this.canvas.clientWidth * dpr));
+      h = Math.max(2, Math.floor(this.canvas.clientHeight * dpr));
+    }
     if (w !== this.w || h !== this.h) { this.w = w; this.h = h; this.canvas.width = w; this.canvas.height = h; }
     return [w, h];
   }
@@ -164,6 +171,59 @@ export class Renderer2D {
   }
 
   render(s) {
+    this._scene(s);
+    if (s.psy > 0) this._psychedelic(s);
+  }
+
+  /** Psychedelic post-process: zoom/rotate video feedback with hue drift, saturation and an
+   *  optional 6-fold kaleidoscope (all with 2D canvas compositing). */
+  _psychedelic(s) {
+    const ctx = this.ctx, { w, h } = this, psy = s.psy;
+    const mk = () => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+    if (!this.cur || this.cur.width !== w || this.cur.height !== h) { this.cur = mk(); this.prev = mk(); this.prevCtx = this.prev.getContext('2d'); }
+    const cc = this.cur.getContext('2d');
+    cc.globalCompositeOperation = 'copy';
+    cc.drawImage(this.canvas, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
+    // previous frame: zoom toward the centre, slow rotation, hue shift → rainbow tunnel trails
+    const ang = 0.003 + 0.004 * Math.sin(s.time * 0.3);
+    const z = 1 + 0.007 * psy;
+    ctx.save();
+    ctx.globalAlpha = Math.min(0.93, 0.88 * psy);
+    ctx.filter = `hue-rotate(${(12 * psy).toFixed(1)}deg)`;
+    ctx.translate(w / 2, h / 2); ctx.rotate(ang); ctx.scale(z, z);
+    ctx.drawImage(this.prev, -w / 2, -h / 2);
+    ctx.restore();
+    // current frame on top ('lighten' = per-channel max, so trails never pile up into white),
+    // hue drifting with time and saturated
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighten';
+    ctx.filter = `hue-rotate(${((s.time * 25 * psy) % 360).toFixed(1)}deg) saturate(${(1 + 0.7 * psy).toFixed(2)})`;
+    if (s.kaleido) {
+      const cx = w / 2, cy = h / 2, R = Math.hypot(w, h), seg = Math.PI / 3;
+      for (let k = 0; k < 6; k++) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        // even wedges: rotated copy; odd wedges: mirrored copy placed in their own slot
+        if (k & 1) { ctx.rotate((k + 1) * seg + s.time * 0.05); ctx.scale(1, -1); }
+        else ctx.rotate(k * seg + s.time * 0.05);
+        ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(R, 0); ctx.lineTo(R * Math.cos(seg), R * Math.sin(seg)); ctx.closePath();
+        ctx.clip();
+        ctx.drawImage(this.cur, -cx, -cy);
+        ctx.restore();
+      }
+    } else ctx.drawImage(this.cur, 0, 0);
+    ctx.restore();
+    ctx.filter = 'none';
+    // remember this frame for the next feedback step
+    this.prevCtx.globalCompositeOperation = 'copy';
+    this.prevCtx.drawImage(this.canvas, 0, 0);
+  }
+
+  _scene(s) {
     const ctx = this.ctx, { w, h } = this, { vp } = s.cam, H = s.half;
     ctx.globalCompositeOperation = 'source-over';
     ctx.fillStyle = '#030306';

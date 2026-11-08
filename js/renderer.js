@@ -215,14 +215,60 @@ void main(){
   s += texture(u_src,uv+vec2(-t.x,-t.y)).rgb + texture(u_src,uv+vec2(t.x,-t.y)).rgb + texture(u_src,uv+vec2(-t.x,t.y)).rgb + texture(u_src,uv+vec2(t.x,t.y)).rgb;
   o = vec4(s/16.0,1.0);
 }`;
+const HUE = `
+// hue rotation in YIQ space (luma-preserving)
+vec3 hueRot(vec3 c, float a){
+  const mat3 toYIQ = mat3(0.299, 0.596, 0.211, 0.587, -0.274, -0.523, 0.114, -0.322, 0.312);
+  const mat3 toRGB = mat3(1.0, 1.0, 1.0, 0.956, -0.272, -1.106, 0.621, -0.647, 1.703);
+  vec3 y = toYIQ * c;
+  float cs = cos(a), sn = sin(a);
+  y.yz = mat2(cs, sn, -sn, cs) * y.yz;
+  return max(toRGB * y, 0.0);
+}`;
+const FEED_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_hdr, u_bloom, u_prev; uniform float u_bloomK, u_psy, u_kaleido, u_time, u_aspect;
+${HUE}
+vec2 kal(vec2 uv){
+  vec2 p = (uv - 0.5) * vec2(u_aspect, 1.0);
+  float r = length(p), a = atan(p.y, p.x) + u_time * 0.05;
+  const float seg = 6.2831853 / 6.0;
+  a = mod(a, seg); a = abs(a - seg * 0.5);
+  return r * vec2(cos(a), sin(a)) / vec2(u_aspect, 1.0) + 0.5;
+}
+void main(){
+  vec2 uv = u_kaleido > 0.5 ? kal(v_uv) : v_uv;
+  vec3 cur = texture(u_hdr, uv).rgb + texture(u_bloom, uv).rgb * (u_bloomK / 6.0);
+  // video feedback: previous frame zoomed toward the centre, slowly rotated and hue-shifted
+  vec2 p = (v_uv - 0.5) * vec2(u_aspect, 1.0);
+  float ang = 0.003 + 0.004 * sin(u_time * 0.3);
+  float z = 1.0 - 0.007 * u_psy;
+  vec2 q = mat2(cos(ang), sin(ang), -sin(ang), cos(ang)) * p * z;
+  vec3 prev = hueRot(texture(u_prev, q / vec2(u_aspect, 1.0) + 0.5).rgb, 0.07 * u_psy);
+  // max (not sum) keeps the energy bounded: trails decay geometrically instead of piling up
+  o = vec4(max(cur, prev * clamp(0.88 * u_psy, 0.0, 0.93)), 1.0);
+}`;
 const COMP_FS = `#version 300 es
 precision highp float;
 in vec2 v_uv; out vec4 o;
-uniform sampler2D u_hdr, u_bloom; uniform float u_bloomK, u_time;
+uniform sampler2D u_hdr, u_bloom, u_feed; uniform float u_bloomK, u_time, u_psy;
+${HUE}
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
 vec3 srgb(vec3 c){ return mix(c*12.92, 1.055*pow(c,vec3(1.0/2.4))-0.055, step(0.0031308,c)); }
 void main(){
-  vec3 c = srgb(aces(texture(u_hdr,v_uv).rgb + texture(u_bloom,v_uv).rgb*(u_bloomK/6.0)));
+  vec3 lin;
+  if (u_psy > 0.0) {
+    // chromatic aberration: R and B sampled at slightly different radii
+    vec2 d = (v_uv - 0.5) * 0.006 * u_psy;
+    lin = vec3(texture(u_feed, v_uv + d).r, texture(u_feed, v_uv).g, texture(u_feed, v_uv - d).b);
+    lin = hueRot(lin, u_time * 0.25 * u_psy);
+    float l = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+    lin = max(mix(vec3(l), lin, 1.0 + 0.7 * u_psy), 0.0);            // saturation boost
+  } else {
+    lin = texture(u_hdr,v_uv).rgb + texture(u_bloom,v_uv).rgb*(u_bloomK/6.0);
+  }
+  vec3 c = srgb(aces(lin));
   vec2 q = v_uv - 0.5; c *= 1.0 - dot(q,q)*0.35;
   float n = fract(sin(dot(gl_FragCoord.xy+u_time, vec2(12.9898,78.233)))*43758.5453);
   o = vec4(c + (n-0.5)/255.0, 1.0);
@@ -313,6 +359,8 @@ export class Renderer {
     this.down = compile(gl, FS_TRI, DOWN_FS);
     this.up = compile(gl, FS_TRI, UP_FS);
     this.comp = compile(gl, FS_TRI, COMP_FS);
+    this.feed = compile(gl, FS_TRI, FEED_FS);
+    this.feedIdx = 0;
     this.emptyVao = gl.createVertexArray();
     this.arcVao = gl.createVertexArray();
     this.arcBuf = gl.createBuffer();
@@ -357,12 +405,30 @@ export class Renderer {
 
   resize() {
     const gl = this.gl;
-    const dpr = Math.min(window.devicePixelRatio || 1, 1.5) * this.scale;
-    const w = Math.max(2, Math.floor(this.canvas.clientWidth * dpr));
-    const h = Math.max(2, Math.floor(this.canvas.clientHeight * dpr));
+    let w, h;
+    if (this.targetH) {
+      // fixed internal resolution (e.g. 2160 rows = 4K UHD), clamped to the GPU's limits
+      const maxDim = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), gl.getParameter(gl.MAX_VIEWPORT_DIMS)[0]);
+      const aspect = Math.max(0.2, this.canvas.clientWidth / Math.max(1, this.canvas.clientHeight));
+      h = this.targetH; w = Math.round(h * aspect);
+      if (w > maxDim) { w = maxDim; h = Math.round(w / aspect); }
+      if (h > maxDim) { h = maxDim; w = Math.round(h * aspect); }
+    } else {
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.5) * this.scale;
+      w = Math.max(2, Math.floor(this.canvas.clientWidth * dpr));
+      h = Math.max(2, Math.floor(this.canvas.clientHeight * dpr));
+    }
     if (w !== this.w || h !== this.h) {
       this.w = w; this.h = h;
       this.canvas.width = w; this.canvas.height = h;
+      for (const o of this.feedT || []) { gl.deleteTexture(o.tex); gl.deleteFramebuffer(o.fbo); }
+      this.feedT = [0, 1].map(() => {
+        const tex = this._tex(w, h), fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+        gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+        return { tex, fbo };
+      });
       for (const o of this.targets || []) { gl.deleteTexture(o.tex); gl.deleteFramebuffer(o.fbo); }
       this.targets = [];
       let mw = w, mh = h;
@@ -507,14 +573,37 @@ export class Renderer {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
     gl.disable(gl.BLEND);
+    const psy = s.psy > 0 ? s.psy : 0;
+    let feedTex = null;
+    if (psy > 0) {
+      // psychedelic feedback pass (ping-pong): current frame + warped, hue-shifted previous frame
+      const src = this.feedT[this.feedIdx], dst = this.feedT[1 - this.feedIdx];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+      gl.viewport(0, 0, w, h);
+      const f = this.feed;
+      gl.useProgram(f.p);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, hdr.tex); gl.uniform1i(f.u.u_hdr, 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.targets[1].tex); gl.uniform1i(f.u.u_bloom, 1);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.uniform1i(f.u.u_prev, 2);
+      gl.uniform1f(f.u.u_bloomK, s.bloom);
+      gl.uniform1f(f.u.u_psy, psy);
+      gl.uniform1f(f.u.u_kaleido, s.kaleido ? 1 : 0);
+      gl.uniform1f(f.u.u_time, s.time);
+      gl.uniform1f(f.u.u_aspect, w / h);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      this.feedIdx = 1 - this.feedIdx;
+      feedTex = dst.tex;
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, w, h);
     const c = this.comp;
     gl.useProgram(c.p);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, hdr.tex); gl.uniform1i(c.u.u_hdr, 0);
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.targets[1].tex); gl.uniform1i(c.u.u_bloom, 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, feedTex || hdr.tex); gl.uniform1i(c.u.u_feed, 2);
     gl.uniform1f(c.u.u_bloomK, s.bloom);
     gl.uniform1f(c.u.u_time, s.time);
+    gl.uniform1f(c.u.u_psy, psy);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.activeTexture(gl.TEXTURE0);
   }
