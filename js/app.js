@@ -1,22 +1,29 @@
 import { Renderer } from './renderer.js';
 import { Renderer2D } from './renderer2d.js';
+import { RendererASCII } from './renderer-ascii.js';
 import { Sound } from './audio.js';
 
 const $ = (s) => document.querySelector(s);
 // parameter ids — must match core/src/lib.rs
 const P = { bolts: 0, blobs: 1, heat: 2, flow: 3, eta: 4, quantum: 5, betaLog: 6, workFn: 7, branch: 8, connect: 9,
   ipeak: 10, icc: 11, restrike: 12, slowmo: 13, life: 14, crackle: 15, tension: 16, mic: 17, leader: 18,
-  turb: 19, eddy: 20, diffuse: 21 };
+  turb: 19, eddy: 20, diffuse: 21, gas: 22, psy: 23, vortex: 24, tubes: 25 };
 
 let wasm, renderer;
 const sound = new Sound();
-const ui = { gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 1, mist: 0.6, autoQuality: true, sway: 1, soundOn: false, micOn: false };
+const ui = { ascii: true, glyphSize: 9, asciiGlow: 0.35, dof: 0.22, gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 1, mist: 0.6, autoQuality: true, sway: 1, soundOn: false, micOn: false };
 const HY = 1000, HZ = 900, FOV = 50 * Math.PI / 180;
 const view = { dragX: 0, dragY: 0 };
 
 const f32 = (p, n) => new Float32Array(wasm.memory.buffer, p, n);
 
 const controls = [
+  { sec: 'Style', id: 'glyphSize', label: 'ASCII glyph size (px)', min: 5, max: 24, step: 1, v: 9, ui: 'glyphSize' },
+  { sec: 'Style', id: 'asciiGlow', label: 'ASCII glow behind glyphs', min: 0, max: 1.5, step: 0.05, v: 0.35, ui: 'asciiGlow' },
+  { sec: 'Style', id: 'dof', label: 'Gaussian depth of field (0 = off)', min: 0, max: 0.6, step: 0.01, v: 0.22, ui: 'dof' },
+  { sec: 'Style', id: 'psy', label: 'Psychedelic colour flow', min: 0, max: 4, step: 0.05, v: 1, p: P.psy },
+  { sec: 'Smoke & mist motion', id: 'tubes', label: 'Vortex tubes (helical swirls)', min: 0, max: 8, step: 1, v: 3, p: P.tubes },
+  { sec: 'Smoke & mist motion', id: 'vortex', label: 'Vortex strength', min: 0, max: 3, step: 0.05, v: 1, p: P.vortex },
   { sec: 'Lightning', id: 'bolts', label: 'Bolts', min: 1, max: 10, step: 1, v: 5, p: P.bolts },
   { sec: 'Lightning', id: 'connect', label: 'Connect distance (m)', min: 0, max: 400, step: 5, v: 170, p: P.connect },
   { sec: 'Lightning', id: 'branch', label: 'Branching', min: 0, max: 2, step: 0.01, v: 0.7, p: P.branch },
@@ -53,7 +60,7 @@ function buildPanel() {
   for (const c of controls) {
     if (!secs[c.sec]) {
       const d = document.createElement('details');
-      d.open = c.sec === 'Lightning' || c.sec === 'Smoke & mist motion';
+      d.open = c.sec === 'Style' || c.sec === 'Smoke & mist motion';
       d.innerHTML = `<summary>${c.sec}</summary>`;
       body.appendChild(d);
       secs[c.sec] = d;
@@ -73,22 +80,32 @@ function buildPanel() {
     inp.addEventListener('input', apply);
     apply();
   }
+  const style = secs['Style'];
+  const mk = (html) => { const d = document.createElement('div'); d.className = 'row sel'; d.innerHTML = html; style.insertBefore(d, style.children[1]); return d; };
+  mk(`<span>Gas in the chamber</span><select id="sel-gas">
+      <option value="7" selected>Psychedelic (flows through all spectra)</option><option value="0">Air — real lightning</option>
+      <option value="1">Neon</option><option value="2">Argon</option><option value="3">Xenon</option>
+      <option value="4">Helium</option><option value="5">Mercury vapour</option><option value="6">Krypton</option></select>`);
+  mk(`<span>Render engine</span><select id="sel-render"><option value="ascii" selected>3-D ASCII (CPU — works in every browser)</option><option value="smooth">Smooth HDR (${hasWebGL2 ? 'WebGL2' : 'Canvas 2D — no WebGL2 here'})</option></select>`);
+  $('#sel-gas').onchange = (e) => wasm.set_param(P.gas, +e.target.value);
+  $('#sel-render').onchange = (e) => useEngine(e.target.value);
+  wasm.set_param(P.gas, 7);
   drawBars();
 }
 
 function drawBars() {
+  // emission colour vs temperature, one row per gas (air, Ne, Ar, Xe, He, Hg, Kr)
   const enc = (v) => Math.round(255 * Math.min(1, v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055));
-  for (const [id, table, scale] of [['#tbar', renderer.lut, 1.2]]) {
-    const cv = $(id), g = cv.getContext('2d');
-    cv.width = 256; cv.height = 10;
+  const cv = $('#tbar'), g = cv.getContext('2d'), t = renderer.lut, rows = 7;
+  cv.width = 256; cv.height = rows * 4;
+  for (let r = 0; r < rows; r++)
     for (let x = 0; x < 256; x++) {
-      const T = table.tmin + (table.tmax - table.tmin) * x / 255;
-      const [r, gg, b, B] = Renderer.sample(table, T);
-      const k = Math.min(1, B * scale);
-      g.fillStyle = `rgb(${enc(r * k)},${enc(gg * k)},${enc(b * k)})`;
-      g.fillRect(x, 0, 1, 10);
+      const T = t.tmin + (t.tmax - t.tmin) * x / 255;
+      const [cr, cg, cb, B] = Renderer.sample(t, T, r);
+      const k = Math.min(1, B * 1.2);
+      g.fillStyle = `rgb(${enc(cr * k)},${enc(cg * k)},${enc(cb * k)})`;
+      g.fillRect(x, r * 4, 1, 4);
     }
-  }
 }
 
 // ---------------------------------------------------------------- UI behaviour
@@ -123,8 +140,7 @@ async function toggleMic() {
   $('#btn-mic').classList.toggle('on', ui.micOn);
 }
 
-function setupInput() {
-  const cv = renderer.canvas;
+function attachCanvas(cv) {
   let down = null;
   cv.addEventListener('pointerdown', (e) => {
     cv.setPointerCapture(e.pointerId);
@@ -149,6 +165,10 @@ function setupInput() {
   };
   cv.addEventListener('pointerup', up);
   cv.addEventListener('pointercancel', up);
+}
+
+function setupInput() {
+  attachCanvas(renderer.canvas);
   window.addEventListener('mousemove', poke);
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT') return;
@@ -179,7 +199,7 @@ function adapt(ms) {
   perf.t += ms;
   if (!ui.autoQuality || perf.t < 500) return;   // re-evaluate every half second
   perf.t = 0;
-  const minScale = renderer.fallback ? 0.4 : 0.35;
+  const minScale = renderer.cpu ? 0.5 : renderer.fallback ? 0.4 : 0.35;
   if (perf.avg > 20 && renderer.scale > minScale) renderer.scale = Math.max(minScale, renderer.scale * (perf.avg > 40 ? 0.7 : 0.85));
   else if (perf.avg < 14 && renderer.scale < 1) renderer.scale = Math.min(1, renderer.scale * 1.08);
   perf.reflections = !(renderer.scale <= minScale + 0.01 && perf.avg > 24);
@@ -225,40 +245,59 @@ function frame(now) {
   }
   renderer.render({
     cam, eye, half, time: t,
-    segs: f32(wasm.seg_ptr(), Math.max(1, n) * 8), segCount: n,
+    segs: f32(wasm.seg_ptr(), Math.max(1, n) * 9), segCount: n,
     light: [info[3], info[4], info[5], act], lightColor: [lc[0], lc[1], lc[2]],
     blobPos, blobCol, nBlobs: 0, lava: 0,
+    ascii: ui.ascii, glyphSize: ui.glyphSize, asciiGlow: ui.asciiGlow, dof: ui.dof,
+    focus: 0.32 + 0.22 * Math.sin(t * 0.15) + 0.08 * Math.sin(t * 0.41),
     reflect: ui.reflect, reflections: perf.reflections, mist: ui.mist, gain: ui.gain, thickness: ui.thickness, bloom: ui.bloom,
   });
   requestAnimationFrame(frame);
 }
 
-async function boot() {
-  try { renderer = new Renderer($('#view')); }
-  catch (e) {
-    // WebGL2 missing or its shaders failed: switch to the Canvas 2D renderer on a fresh canvas
-    console.warn('WebGL2 renderer unavailable, using Canvas 2D:', e.message);
-    const old = $('#view'), cv = document.createElement('canvas');
-    cv.id = 'view'; old.replaceWith(cv);
-    try { renderer = new Renderer2D(cv); }
-    catch (e2) { document.body.insertAdjacentHTML('beforeend', `<p class="err">${e2.message}</p>`); return; }
-    const note = document.createElement('div');
-    note.className = 'note';
-    note.textContent = 'Compatibility mode (WebGL2 unavailable) — enable hardware acceleration in your browser for full quality.';
-    document.body.appendChild(note);
-    setTimeout(() => note.classList.add('hide'), 7000);
+// WebGL2 is optional: probe once on a throw-away canvas
+const hasWebGL2 = (() => { try { return !!document.createElement('canvas').getContext('webgl2'); } catch (e) { return false; } })();
+let tables = null;
+
+/** Create a renderer on a fresh canvas: 'ascii' (CPU, default) or 'smooth'. */
+function useEngine(kind) {
+  const old = $('#view'), cv = document.createElement('canvas');
+  cv.id = 'view'; old.replaceWith(cv);
+  let r = null;
+  if (kind === 'smooth') {
+    if (hasWebGL2) { try { r = new Renderer(cv); ui.ascii = false; } catch (e) { console.warn('WebGL2 failed:', e.message); r = null; } }
+    if (!r) {
+      const c2 = document.createElement('canvas'); c2.id = 'view'; cv.replaceWith(c2);
+      r = new Renderer2D(c2); ui.ascii = false;
+    }
+  } else {
+    r = new RendererASCII(cv);
   }
+  renderer = r;
+  if (tables) {
+    renderer.setLUT(tables.lut, tables.n, tables.rows, tables.tmin, tables.tmax);
+    renderer.setBlackbody(tables.bb, tables.bbn, tables.bbmin, tables.bbmax);
+  }
+  attachCanvas(renderer.canvas);
+}
+
+async function boot() {
+  renderer = new RendererASCII($('#view'));
   const bytes = await (await fetch('lightning.wasm')).arrayBuffer();
   wasm = (await WebAssembly.instantiate(bytes, {})).instance.exports;
   wasm.init((Math.random() * 2 ** 31) >>> 0);
-  renderer.setLUT(f32(wasm.lut_ptr(), wasm.lut_len() * 4).slice(), wasm.lut_len(), wasm.lut_tmin(), wasm.lut_tmax());
-  renderer.setBlackbody(f32(wasm.bb_ptr(), wasm.bb_len() * 4).slice(), wasm.bb_len(), wasm.bb_tmin(), wasm.bb_tmax());
+  tables = {
+    lut: f32(wasm.lut_ptr(), wasm.lut_len() * wasm.lut_rows() * 4).slice(), n: wasm.lut_len(), rows: wasm.lut_rows(), tmin: wasm.lut_tmin(), tmax: wasm.lut_tmax(),
+    bb: f32(wasm.bb_ptr(), wasm.bb_len() * 4).slice(), bbn: wasm.bb_len(), bbmin: wasm.bb_tmin(), bbmax: wasm.bb_tmax(),
+  };
+  renderer.setLUT(tables.lut, tables.n, tables.rows, tables.tmin, tables.tmax);
+  renderer.setBlackbody(tables.bb, tables.bbn, tables.bbmin, tables.bbmax);
   const [w, h] = renderer.resize();
   wasm.set_box(HY * w / h, HY, HZ);
   buildPanel();
   setupInput();
   poke();
-  window.__lm = { wasm, togglePanel, ui, perf, get renderer() { return renderer; } };
+  window.__lm = { wasm, togglePanel, ui, perf, useEngine, get renderer() { return renderer; } };
   requestAnimationFrame((tt) => { last = tt; frame(tt); });
 }
 boot();

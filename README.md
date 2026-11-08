@@ -1,8 +1,17 @@
-# ⚡ Lightning Machine — lightning in a glass chamber
+# ⚡ Lightning Machine — 3-D ASCII lightning in a glass chamber
 
 Live: **https://xboxzero.github.io/lightningmachine/**
 
 Your screen is the front glass of a dark chamber. Inside, real-physics lightning grows, strikes, re-strikes, links up with neighbouring bolts, and slowly folds around in 3D on a lava-lamp-style convection flow. The viewpoint drifts on its own, and the perspective is always corrected so the screen behaves like a window into the box.
+
+## Render engines
+- **3-D ASCII (default, CPU + Canvas 2D, needs no WebGL):**
+  - Lightning segments are projected through the off-axis window camera and rasterised straight into a grid of character cells.
+  - Each sample deposits a sharp **Gaussian** core splat (σ ≈ 0.42 cell) and a wide Gaussian glow splat (σ ≈ 1.8 cells) for mist.
+  - The projected channel direction is averaged as a doubled-angle vector, so lines get exact `- / | \` glyphs; elsewhere a brightness ramp is used.
+  - Per-cell depth gives the 3D look: perspective glyph size, depth haze, glyphs extruded toward the vanishing point, and **Gaussian depth of field** around a drifting focal depth.
+  - The glass chamber's edges are drawn in ASCII too.
+- **Smooth HDR (optional):** WebGL2 when the browser has it, otherwise a Canvas 2D smooth renderer.
 
 ## Physics and maths (Rust → WebAssembly, `core/src/lib.rs`)
 | | Model |
@@ -13,6 +22,8 @@ Your screen is the front glass of a dark chamber. Inside, real-physics lightning
 | **Stepped leader** | 3-D stochastic dielectric breakdown. Candidate steps are weighted by (d̂·Ê)^η × T_WKB^w × e^{σN} and one is picked by the Born rule (P ∝ \|ψ\|²). Tips fork at random. |
 | **Connections** | Leader tips attach to positive cells **or to any existing channel** (found with a spatial hash). Hot channels of different bolts that drift close together get bridging leaders. When one channel is hit by another, it re-strikes. |
 | **Return stroke** | Heidler current function (IEC 62305-1), MTLE propagation at 1.2×10⁸ m/s, CIGRE peak-current statistics, re-strikes and continuing current. Temperature T = 4000 + 26000·(I/30 kA)^0.12. |
+| **Gas spectra** | You choose the gas in the chamber: air (real lightning), neon, argon, xenon, helium, mercury vapour or krypton. Each uses its NIST emission lines with Boltzmann × Saha weighting plus a recombination continuum, integrated through CIE 1931. **Psychedelic** mode moves each channel's gas coordinate along its length and over time, so colours flow through the real spectra. |
+| **Vortex tubes** | Burgers vortices, u_θ = Γ/(2πr)(1 − e^{−r²/r_c²}), with axial strain and precessing axes. They wrap filaments into organic helices, and the turbulence slowly breathes. |
 | **Colour** | From the colour temperature of the air plasma: N II, O II, N I, O I and H emission lines (Boltzmann excitation × Saha ionisation) plus a recombination continuum, integrated against the CIE 1931 colour tables → sRGB. The channel flashes blue-violet-white, then cools through pink-violet to red. |
 | **Smoke-like motion** | Kinematic-simulation turbulence (Kraichnan; Fung et al. 1992): divergence-free random Fourier modes whose energies follow Kolmogorov's E(k) ∝ k^{−5/3}, each changing at its eddy-turnover rate. This gives random, folding, smoke- or mist-like motion. Added to it: Stokes flow dragged by the charge cells, weak convection rolls, Brownian mist diffusion √(2D·dt), and recirculation where the smoke meets the glass. The velocity field is built with separable complex phasors on a coarse grid, refreshed every other frame, and trilinearly interpolated. Cooling channels widen into soft haze while keeping the same total light. |
 | **Glass** | Off-axis "window" projection (Kooima). Mirror images in the five walls via the method of images, clipped to each wall and weighted by glass Fresnel reflectance (Schlick, n = 1.5, R₀ = 4%). |

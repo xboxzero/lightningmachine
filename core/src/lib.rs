@@ -21,8 +21,9 @@
 //!   (spatial hash); nearby hot channels of different bolts spawn bridging leaders.
 //! Return stroke — Heidler current (IEC 62305-1), MTLE propagation, CIGRE currents,
 //!   re-strikes, continuing current; T = 4000 + 26000·(I/30 kA)^0.12.
-//! Colour — lightning: air-plasma emission (N II/O II/N I/O I/H lines, Boltzmann ×
-//!   Saha, recombination continuum) → CIE 1931 → sRGB. Lava: Planck black body
+//! Colour — gas-discharge emission spectra (air N II/O II/N I/O I/H, Ne, Ar, Xe, He, Hg, Kr:
+//!   NIST lines, Boltzmann × Saha, recombination continuum) → CIE 1931 → sRGB.
+//! Vortex tubes — Burgers vortices with precessing axes wrap filaments into helices. Lava: Planck black body
 //!   (colour temperature).
 
 #![allow(static_mut_refs)]
@@ -35,7 +36,7 @@ const LUT_TMAX: f32 = 40000.0;
 const BB_N: usize = 256;
 const BB_TMIN: f32 = 800.0;
 const BB_TMAX: f32 = 12000.0;
-const SEG_FLOATS: usize = 8;
+const SEG_FLOATS: usize = 9;
 const MAX_SEGS: usize = 60000;
 const MAX_BOLTS: usize = 10;
 const MAX_BRIDGES: usize = 12;
@@ -147,43 +148,81 @@ fn blackbody(t: f64) -> ([f32; 3], f64) {
     }
     (xyz_to_rgb(x, y, z), y)
 }
-fn saha_nitrogen(t: f64) -> f64 {
+/// Saha equation for a single ionisation stage → ionisation fraction x (n_tot ≈ 0.1 atm).
+fn saha(t: f64, chi_ev: f64, g_ratio: f64) -> f64 {
     let n_tot = 2.5e24;
-    let s = 2.415e21 * t.powf(1.5) * 4.5 * (-14.534 / (K_B_EV * t)).exp() / n_tot;
+    let s = 2.415e21 * t.powf(1.5) * 2.0 * g_ratio * (-chi_ev / (K_B_EV * t)).exp() / n_tot;
     (-s + (s * s + 4.0 * s).sqrt()) / 2.0
 }
-/// Air-plasma emission colour at temperature T (lines + continuum).
-fn lightning_color(t: f64) -> ([f32; 3], f64) {
-    let kt = K_B_EV * t;
-    let x_ion = saha_nitrogen(t);
-    // (λ nm, upper level eV, relative gA × abundance, ion?)
-    const LINES: [(f64, f64, f64, u8); 21] = [
-        (399.5, 21.60, 0.30, 1),
-        (404.1, 23.42, 0.20, 1),
-        (444.7, 23.20, 0.30, 1),
-        (463.0, 21.16, 0.70, 1),
-        (480.3, 23.24, 0.40, 1),
-        (500.5, 23.14, 1.00, 1),
-        (567.9, 20.67, 0.65, 1),
-        (594.2, 23.24, 0.30, 1),
-        (648.2, 20.41, 0.15, 1),
-        (434.9, 25.85, 0.15, 1),
-        (441.5, 26.25, 0.15, 1),
-        (464.9, 25.66, 0.15, 1),
-        (656.3, 12.09, 0.012, 0),
-        (486.1, 12.75, 0.004, 0),
-        (434.0, 13.05, 0.002, 0),
-        (746.8, 11.99, 0.60, 0),
-        (821.6, 11.84, 0.50, 0),
-        (777.4, 10.74, 1.00, 0),
-        (844.6, 10.99, 0.50, 0),
-        (715.6, 14.46, 0.30, 0),
+
+/// Gas fills of the chamber. Index 0 is air (real lightning); the others are the noble
+/// gases / vapours used in plasma globes and discharge tubes.
+pub const GAS_N: usize = 7;
+type Line = (f64, f64, f64, u8); // (λ nm, upper level eV, relative gA·abundance, 1 = ion line)
+
+/// Strong visible lines (NIST ASD, rounded) with ionisation energy χ and g-ratio.
+fn gas_lines(gas: usize) -> (&'static [Line], f64, f64) {
+    const AIR: [Line; 21] = [
+        (399.5, 21.60, 0.30, 1), (404.1, 23.42, 0.20, 1), (444.7, 23.20, 0.30, 1), (463.0, 21.16, 0.70, 1),
+        (480.3, 23.24, 0.40, 1), (500.5, 23.14, 1.00, 1), (567.9, 20.67, 0.65, 1), (594.2, 23.24, 0.30, 1),
+        (648.2, 20.41, 0.15, 1), (434.9, 25.85, 0.15, 1), (441.5, 26.25, 0.15, 1), (464.9, 25.66, 0.15, 1),
+        (656.3, 12.09, 0.012, 0), (486.1, 12.75, 0.004, 0), (434.0, 13.05, 0.002, 0), (746.8, 11.99, 0.60, 0),
+        (821.6, 11.84, 0.50, 0), (777.4, 10.74, 1.00, 0), (844.6, 10.99, 0.50, 0), (715.6, 14.46, 0.30, 0),
         (615.8, 12.75, 0.40, 0),
     ];
+    const NEON: [Line; 10] = [
+        (585.2, 18.97, 1.0, 0), (640.2, 18.56, 1.0, 0), (614.3, 18.64, 0.7, 0), (703.2, 18.38, 0.6, 0),
+        (692.9, 18.64, 0.5, 0), (667.8, 18.69, 0.4, 0), (650.6, 18.58, 0.5, 0), (540.1, 18.97, 0.25, 0),
+        (588.2, 18.73, 0.4, 0), (439.2, 34.80, 0.25, 1),
+    ];
+    const ARGON: [Line; 15] = [
+        (750.4, 13.48, 1.0, 0), (763.5, 13.17, 1.0, 0), (811.5, 13.08, 1.0, 0), (696.5, 13.33, 0.5, 0),
+        (706.7, 13.30, 0.4, 0), (738.4, 13.30, 0.4, 0), (415.9, 14.53, 0.15, 0), (420.1, 14.50, 0.12, 0),
+        (434.8, 19.49, 0.8, 1), (488.0, 19.68, 1.0, 1), (476.5, 19.87, 0.6, 1), (454.5, 19.87, 0.5, 1),
+        (480.6, 19.22, 0.7, 1), (472.7, 19.76, 0.4, 1), (442.6, 19.55, 0.5, 1),
+    ];
+    const XENON: [Line; 14] = [
+        (467.1, 11.00, 0.6, 0), (462.4, 10.97, 0.4, 0), (473.4, 10.97, 0.3, 0), (823.2, 9.82, 1.0, 0),
+        (828.0, 9.93, 1.0, 0), (881.9, 9.82, 1.0, 0), (492.3, 10.98, 0.3, 0), (484.4, 14.10, 0.8, 1),
+        (529.2, 14.10, 0.6, 1), (541.9, 14.10, 0.7, 1), (460.3, 14.10, 0.6, 1), (533.9, 14.10, 0.4, 1),
+        (605.1, 14.10, 0.4, 1), (699.1, 14.10, 0.3, 1),
+    ];
+    const HELIUM: [Line; 9] = [
+        (587.6, 23.07, 1.0, 0), (667.8, 23.07, 0.3, 0), (706.5, 22.72, 0.4, 0), (501.6, 23.09, 0.25, 0),
+        (447.1, 23.74, 0.4, 0), (492.2, 23.74, 0.1, 0), (388.9, 23.01, 0.4, 0), (471.3, 23.59, 0.1, 0),
+        (468.6, 51.00, 0.5, 1),
+    ];
+    const MERCURY: [Line; 7] = [
+        (435.8, 7.73, 1.0, 0), (546.1, 7.73, 1.0, 0), (404.7, 7.73, 0.6, 0), (577.0, 8.85, 0.35, 0),
+        (579.1, 8.84, 0.4, 0), (491.6, 8.84, 0.08, 0), (407.8, 7.73, 0.1, 0),
+    ];
+    const KRYPTON: [Line; 11] = [
+        (557.0, 12.14, 0.8, 0), (587.1, 12.14, 0.8, 0), (760.2, 11.55, 1.0, 0), (811.3, 11.44, 1.0, 0),
+        (431.9, 12.86, 0.3, 0), (450.2, 12.79, 0.25, 0), (445.4, 12.85, 0.2, 0), (435.5, 16.20, 0.6, 1),
+        (461.9, 16.30, 0.5, 1), (473.9, 16.30, 0.4, 1), (483.2, 16.30, 0.4, 1),
+    ];
+    match gas {
+        1 => (&NEON, 21.565, 1.5),
+        2 => (&ARGON, 15.760, 1.5),
+        3 => (&XENON, 12.130, 1.5),
+        4 => (&HELIUM, 24.587, 2.0),
+        5 => (&MERCURY, 10.438, 1.0),
+        6 => (&KRYPTON, 13.999, 1.5),
+        _ => (&AIR, 14.534, 2.25),
+    }
+}
+
+/// Emission colour of a gas-discharge channel at temperature T: Boltzmann-weighted lines of
+/// the neutral (1 − x) and ion (x) stages from the Saha balance, plus a recombination /
+/// bremsstrahlung continuum ∝ x² with Planck shape. → (sRGB chromaticity, luminance Y).
+fn gas_color(t: f64, gas: usize) -> ([f32; 3], f64) {
+    let kt = K_B_EV * t;
+    let (lines, chi, g) = gas_lines(gas);
+    let x_ion = saha(t, chi, g);
     let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
-    for &(lam, eu, g, ion) in LINES.iter() {
+    for &(lam, eu, gw, ion) in lines.iter() {
         let frac = if ion == 1 { x_ion } else { 1.0 - x_ion };
-        let i = 3.0e12 * g * frac * (-eu / kt).exp();
+        let i = 3.0e12 * gw * frac * (-eu / kt).exp();
         let (cx, cy, cz) = cie_xyz(lam);
         x += i * cx;
         y += i * cy;
@@ -256,6 +295,7 @@ struct Tip {
 
 struct Bolt {
     uid: u32,
+    hue: f32, // psychedelic gas-coordinate phase
     nodes: Vec<Node>,
     tips: Vec<Tip>,
     phase: Phase,
@@ -281,6 +321,17 @@ struct Blob {
     temp: f32, // K (lava colour temperature)
     q: f32,    // C
     a: f32,    // radius (m)
+}
+
+/// Burgers vortex tube: swirl u_θ = Γ/(2πr)(1 − e^{−r²/r_c²}) about a wandering axis,
+/// with a gentle axial strain that draws filaments in and stretches them into helices.
+#[derive(Clone, Copy)]
+struct Tube {
+    p: V3,
+    axis: V3,
+    gamma: f32,
+    rc: f32,
+    spin: V3, // slow precession of the axis
 }
 
 /// One Fourier mode of the kinematic-simulation turbulence field.
@@ -322,7 +373,11 @@ const P_LEADER_SPEED: usize = 18;
 const P_TURB: usize = 19; // rms turbulent velocity (m/s)
 const P_EDDY: usize = 20; // largest eddy size (m)
 const P_DIFFUSE: usize = 21; // small-scale (mist) diffusivity (m²/s)
-const N_PARAMS: usize = 22;
+const P_GAS: usize = 22; // 0..6 gas fill, 7 = psychedelic (flowing through all spectra)
+const P_PSY: usize = 23; // psychedelic colour-flow speed
+const P_VORTEX: usize = 24; // vortex-tube circulation scale
+const P_TUBES: usize = 25; // number of vortex tubes
+const N_PARAMS: usize = 26;
 
 struct Grid {
     dims: [usize; 3],
@@ -362,6 +417,7 @@ struct Sim {
     fdims: [usize; 3],
     fcell: V3,
     flow_frame: u32,
+    tubes: Vec<Tube>,
 }
 
 static mut SIM: Option<Sim> = None;
@@ -379,6 +435,7 @@ fn cell_of(p: V3, h: V3, dims: [usize; 3]) -> usize {
 fn placeholder() -> Bolt {
     Bolt {
         uid: 0,
+        hue: 0.0,
         nodes: Vec::new(),
         tips: Vec::new(),
         phase: Phase::Fizzle,
@@ -422,6 +479,10 @@ impl Sim {
         p[P_TURB] = 70.0;
         p[P_EDDY] = 1400.0;
         p[P_DIFFUSE] = 60.0;
+        p[P_GAS] = 7.0;
+        p[P_PSY] = 1.0;
+        p[P_VORTEX] = 1.0;
+        p[P_TUBES] = 3.0;
         p[P_FLOW] = 0.4;
         let mut s = Sim {
             rng: Rng(0x853c49e6748fea9b ^ ((seed as u64) << 21 | seed as u64)),
@@ -443,7 +504,7 @@ impl Sim {
             out: vec![0.0; MAX_SEGS * SEG_FLOATS],
             blob_out: vec![0.0; MAX_BLOBS * 8],
             info: [0.0; 16],
-            lut: vec![0.0; LUT_N * 4],
+            lut: vec![0.0; LUT_N * 4 * (GAS_N + 1)],
             bb_lut: vec![0.0; BB_N * 4],
             kids: Vec::new(),
             first_child: Vec::new(),
@@ -454,15 +515,22 @@ impl Sim {
             fdims: [2, 2, 2],
             fcell: [1.0; 3],
             flow_frame: 0,
+            tubes: Vec::new(),
         };
-        let yref = lightning_color(30000.0).1;
-        for i in 0..LUT_N {
-            let t = LUT_TMIN + (LUT_TMAX - LUT_TMIN) * i as f32 / (LUT_N - 1) as f32;
-            let (c, y) = lightning_color(t as f64);
-            s.lut[i * 4..i * 4 + 3].copy_from_slice(&c);
-            // perceived brightness: Fechner's law over ~7 decades
-            let f = (1.0 + (y / yref).max(1e-30).log10() / 7.0).max(0.0);
-            s.lut[i * 4 + 3] = (f * f) as f32;
+        // emission-colour table: one row per gas (row GAS_N repeats air so the
+        // psychedelic gas coordinate can wrap around smoothly)
+        for gas in 0..=GAS_N {
+            let gi = gas % GAS_N;
+            let yref = gas_color(30000.0, gi).1;
+            for i in 0..LUT_N {
+                let t = LUT_TMIN + (LUT_TMAX - LUT_TMIN) * i as f32 / (LUT_N - 1) as f32;
+                let (c, y) = gas_color(t as f64, gi);
+                let o = (gas * LUT_N + i) * 4;
+                s.lut[o..o + 3].copy_from_slice(&c);
+                // perceived brightness: Fechner's law over ~7 decades
+                let f = (1.0 + (y / yref).max(1e-30).log10() / 7.0).max(0.0);
+                s.lut[o + 3] = (f * f) as f32;
+            }
         }
         let yb = blackbody(2500.0).1;
         for i in 0..BB_N {
@@ -609,7 +677,8 @@ impl Sim {
         g.clear();
         g.resize(n, [0.0; 3]);
         let t = self.time;
-        let tscale = 1.0 + 1.5 * self.p[P_MIC];
+        // the turbulence slowly 'breathes' (two incommensurate periods → never repeats)
+        let tscale = (1.0 + 1.5 * self.p[P_MIC]) * (1.0 + 0.35 * (self.time * 0.13).sin() + 0.2 * (self.time * 0.051).sin());
         // separable phasors: e^{i(k·x+ωt)} = e^{i kx x}·e^{i ky y}·e^{i(kz z + ωt)}
         let mut px = vec![(0.0f32, 0.0f32); dims[0]];
         let mut py = vec![(0.0f32, 0.0f32); dims[1]];
@@ -674,10 +743,58 @@ impl Sim {
         self.fgrid = g;
     }
 
-    /// Blob-driven Stokes flow and gentle convection rolls (lava-lamp component).
+    fn update_tubes(&mut self, dt: f32) {
+        let n = (self.p[P_TUBES] as usize).min(8);
+        let h = self.half;
+        while self.tubes.len() < n {
+            let sign = if self.tubes.len() % 2 == 0 { 1.0 } else { -1.0 };
+            let t = Tube {
+                p: [self.rng.range(-0.5, 0.5) * h[0], self.rng.range(-0.5, 0.5) * h[1], self.rng.range(-0.5, 0.5) * h[2]],
+                axis: norm(self.rng.gauss3()),
+                gamma: sign * self.rng.range(0.8, 1.3) * 2.5e5,
+                rc: self.rng.range(120.0, 220.0),
+                spin: mul(self.rng.gauss3(), 0.08),
+            };
+            self.tubes.push(t);
+        }
+        self.tubes.truncate(n);
+        for i in 0..self.tubes.len() {
+            let wander = mul(self.rng.gauss3(), 25.0 * dt.sqrt());
+            let v = self.velocity(self.tubes[i].p);
+            let tb = &mut self.tubes[i];
+            tb.p = add(tb.p, add(mul(v, dt * 0.4), wander));
+            for a in 0..3 {
+                tb.p[a] = tb.p[a].clamp(-0.6 * h[a], 0.6 * h[a]);
+            }
+            // precess the axis: a ← a + (ω × a) dt
+            let w = tb.spin;
+            let ax = tb.axis;
+            let c = [w[1] * ax[2] - w[2] * ax[1], w[2] * ax[0] - w[0] * ax[2], w[0] * ax[1] - w[1] * ax[0]];
+            tb.axis = norm(add(ax, mul(c, dt)));
+        }
+    }
+
+    /// Blob-driven Stokes flow, Burgers vortex tubes and gentle convection rolls.
     fn flow_extra(&self, x: V3) -> V3 {
         let h = self.half;
         let mut u = [0.0f32; 3];
+        let vs = self.p[P_VORTEX] * (1.0 + 0.4 * (self.time * 0.21).sin());
+        for tb in self.tubes.iter() {
+            let d = sub(x, tb.p);
+            let along = dot(d, tb.axis);
+            let rv = sub(d, mul(tb.axis, along));
+            let r2 = dot(rv, rv) + 1.0;
+            let r = r2.sqrt();
+            let rc2 = tb.rc * tb.rc;
+            // azimuthal swirl (θ̂ = axis × r̂)
+            let th = [tb.axis[1] * rv[2] - tb.axis[2] * rv[1], tb.axis[2] * rv[0] - tb.axis[0] * rv[2], tb.axis[0] * rv[1] - tb.axis[1] * rv[0]];
+            let ut = tb.gamma * vs / (2.0 * PI * r2) * (1.0 - (-r2 / rc2).exp());
+            u = add(u, mul(th, ut));
+            // Burgers strain: inflow −αr/2, axial outflow αz (Gaussian-limited)
+            let alpha = 0.05 * vs * (-r2 / (16.0 * rc2)).exp() * (-(along * along) / (4.0e6)).exp();
+            u = add(u, add(mul(rv, -0.5 * alpha), mul(tb.axis, alpha * along)));
+            let _ = r;
+        }
         for b in self.blobs.iter() {
             let d = sub(x, b.p);
             let r2 = dot(d, d);
@@ -815,6 +932,7 @@ impl Sim {
         b.target = target;
         b.bridge = bridge;
         b.life = life;
+        b.hue = self.rng.f() * GAS_N as f32;
         self.bolts.push(b);
     }
 
@@ -1206,6 +1324,7 @@ impl Sim {
         self.move_blobs(dt);
         // eddies evolve slowly: refresh the velocity grid every other frame
         self.flow_frame = self.flow_frame.wrapping_add(1);
+        self.update_tubes(dt);
         if self.flow_frame % 2 == 0 || self.fgrid.is_empty() {
             self.build_flow();
         }
@@ -1252,6 +1371,18 @@ impl Sim {
         self.emit()
     }
 
+    /// Gas coordinate of a channel point: a fixed gas, or (psychedelic) a phase that flows
+    /// along the channel and through time, so the colour drifts through the real emission
+    /// spectra of the different gases.
+    fn gas_coord(&self, b: &Bolt, dist: f32) -> f32 {
+        let g = self.p[P_GAS];
+        if g < 6.5 {
+            return g.round().clamp(0.0, (GAS_N - 1) as f32);
+        }
+        let ph = b.hue + self.time * 0.12 * self.p[P_PSY] + dist * 0.0009;
+        ph.rem_euclid(GAS_N as f32)
+    }
+
     fn emit(&mut self) -> u32 {
         let crackle = self.p[P_CRACKLE];
         let mut k = 0usize;
@@ -1286,6 +1417,7 @@ impl Sim {
                 self.out[o + 3..o + 6].copy_from_slice(&e);
                 self.out[o + 6] = t;
                 self.out[o + 7] = if has_child[i] { w } else { -w };
+                self.out[o + 8] = self.gas_coord(b, nd.dist + nd.depth as f32 * 120.0);
                 let li = (((t - LUT_TMIN) / (LUT_TMAX - LUT_TMIN)) * (LUT_N - 1) as f32).clamp(0.0, (LUT_N - 1) as f32) as usize;
                 let lum = self.lut[li * 4 + 3] * w * STEP;
                 act += lum;
@@ -1318,6 +1450,7 @@ impl Sim {
                 self.out[o + 3..o + 6].copy_from_slice(&nb.p);
                 self.out[o + 6] = t;
                 self.out[o + 7] = 0.9;
+                self.out[o + 8] = self.gas_coord(a, na.dist);
                 k += 1;
             }
         }
@@ -1420,6 +1553,10 @@ pub extern "C" fn info_ptr() -> *const f32 {
 #[no_mangle]
 pub extern "C" fn lut_ptr() -> *const f32 {
     sim().lut.as_ptr()
+}
+#[no_mangle]
+pub extern "C" fn lut_rows() -> u32 {
+    (GAS_N + 1) as u32
 }
 #[no_mangle]
 pub extern "C" fn lut_len() -> u32 {
