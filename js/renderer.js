@@ -159,6 +159,40 @@ void main(){
   col += c*exp(-max(r-0.85,0.0)*3.0)*0.12*step(0.95, r);   // glow scattered by the fluid
   o = vec4(col, 1.0);
 }`;
+const PUFF_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec4 a_pr; layout(location=1) in vec4 a_drks;   // xyz,radius | density, rotation, kind, seed
+uniform mat4 u_vp; uniform vec4 u_light; uniform float u_dens;
+out vec2 v_q; out float v_dens; out float v_rot; out float v_kind; out float v_seed; out float v_ill;
+void main(){
+  vec2 q = vec2(float(gl_VertexID&1), float((gl_VertexID>>1)&1))*2.0-1.0;
+  v_q = q; v_dens = a_drks.x * u_dens; v_rot = a_drks.y; v_kind = a_drks.z; v_seed = a_drks.w;
+  vec3 d = a_pr.xyz - u_light.xyz;
+  v_ill = u_light.w * 2.2e5 / (dot(d,d) + 2.5e5);             // light from the discharge
+  gl_Position = u_vp * vec4(a_pr.xyz + vec3(q * a_pr.w * 1.2, 0.0), 1.0);
+}`;
+const PUFF_FS = `#version 300 es
+precision highp float;
+in vec2 v_q; in float v_dens; in float v_rot; in float v_kind; in float v_seed; in float v_ill; out vec4 o;
+uniform vec3 u_lcol; uniform float u_time;
+float hash(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+float vnoise(vec3 p){ vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z); }
+void main(){
+  float r2 = dot(v_q, v_q);
+  if (r2 > 1.0) discard;
+  float c = cos(v_rot), s = sin(v_rot);
+  vec2 p = mat2(c, s, -s, c) * v_q * 1.6 + v_seed * 17.0;
+  float n = 0.0, a = 0.5;
+  vec3 pp = vec3(p, u_time * 0.05 + v_seed * 5.0);
+  for (int i = 0; i < 4; i++) { n += a * vnoise(pp); pp = pp * 2.1 + vec3(1.7, 9.2, 3.1); a *= 0.5; }
+  float d = exp(-r2 * 3.2) * clamp((n - 0.25) * 2.2, 0.0, 1.0);
+  float alpha = clamp(v_dens * d * (v_kind > 0.5 ? 0.9 : 0.75), 0.0, 0.95);
+  vec3 body = v_kind > 0.5 ? vec3(0.013, 0.014, 0.018) : vec3(0.009, 0.010, 0.013);
+  vec3 col = body + u_lcol * (0.025 + v_ill) * 0.7;           // scattered discharge light
+  o = vec4(col * alpha, alpha);                                // premultiplied alpha
+}`;
 const DOWN_FS = `#version 300 es
 precision highp float;
 in vec2 v_uv; out vec4 o; uniform sampler2D u_src; uniform vec2 u_texel;
@@ -266,6 +300,16 @@ export class Renderer {
     this.arc = compile(gl, ARC_VS, ARC_FS);
     this.chamber = compile(gl, FS_TRI, CHAMBER_FS);
     this.blob = compile(gl, BLOB_VS, BLOB_FS);
+    this.puff = compile(gl, PUFF_VS, PUFF_FS);
+    this.puffVao = gl.createVertexArray();
+    this.puffBuf = gl.createBuffer();
+    gl.bindVertexArray(this.puffVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.puffBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, 4 * 8 * 400, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(0, 1);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 16); gl.vertexAttribDivisor(1, 1);
+    gl.bindVertexArray(null);
+    this.puffSorted = new Float32Array(8 * 400);
     this.down = compile(gl, FS_TRI, DOWN_FS);
     this.up = compile(gl, FS_TRI, UP_FS);
     this.comp = compile(gl, FS_TRI, COMP_FS);
@@ -373,6 +417,32 @@ export class Renderer {
       gl.uniform4f(p.u.u_col, s.blobCol[i * 4], s.blobCol[i * 4 + 1], s.blobCol[i * 4 + 2], s.blobCol[i * 4 + 3] * s.lava);
       gl.uniform1f(p.u.u_seed, i * 1.7);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    // 2b) smoke and clouds: back-to-front, premultiplied alpha (absorbing body + scattered light)
+    if (s.puffCount > 0) {
+      const P = s.puffs, idx = [];
+      for (let i = 0; i < s.puffCount; i++) {
+        const o = i * 8;
+        if (P[o + 4] < 0.004) continue;
+        const wclip = vp[3] * P[o] + vp[7] * P[o + 1] + vp[11] * P[o + 2] + vp[15];
+        idx.push([wclip, o]);
+      }
+      idx.sort((a, b) => b[0] - a[0]);
+      for (let k = 0; k < idx.length; k++) this.puffSorted.set(P.subarray(idx[k][1], idx[k][1] + 8), k * 8);
+      p = this.puff;
+      gl.useProgram(p.p);
+      gl.bindVertexArray(this.puffVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.puffBuf);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.puffSorted, 0, idx.length * 8);
+      gl.uniformMatrix4fv(p.u.u_vp, false, vp);
+      gl.uniform4fv(p.u.u_light, s.light);
+      gl.uniform3fv(p.u.u_lcol, s.lightColor);
+      gl.uniform1f(p.u.u_dens, s.smoke);
+      gl.uniform1f(p.u.u_time, s.time);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, idx.length);
+      gl.blendFunc(gl.ONE, gl.ONE);
     }
 
     // 3) lightning + its reflections in the five glass walls

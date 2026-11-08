@@ -24,6 +24,9 @@ The buttons in the bottom-right corner hide after 2.5 s of no activity; move the
 - **Panel sections:** Lightning · Quantum tunnelling · Chamber flow · Glass & view. Raise *Glass reflection* above 1 for a kaleidoscope-like effect.
 - **Keys:** Space strike · H panel · F fullscreen · S sound · M mic
 
+## Smoke & clouds
+Smoke and cloud puffs are carried by the same turbulent flow as the lightning, so they fold, shear into wisps and swirl. Each puff turns with the local vorticity of the flow. Turbulent diffusion spreads each puff (r² = r₀² + 4·D·t) while its density thins as (r₀/r)², since the mass is conserved, and puffs fade in and out. Some smoke rises from the hot channels. Clouds drift in the upper part of the chamber. Every flash lights nearby smoke and clouds in the discharge's spectral colour, with intensity falling off with distance from the discharge.
+
 ## Sound
 Each strike's crack and rumble is a 3D (HRTF) source. It starts at the strike point and glides toward the channel's glowing centre as it rumbles, so the thunder moves inside the chamber. The glass chamber adds early wall reflections and a dark diffuse tail. Headphones work best.
 

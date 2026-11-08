@@ -226,6 +226,11 @@ fn t_of_current(i: f32) -> f32 {
     (4000.0 + 26000.0 * (i / 30_000.0).powf(0.12)).min(38_000.0)
 }
 
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 // ---------------------------------------------------------------- model
 #[derive(Clone, Copy)]
 struct Node {
@@ -322,7 +327,23 @@ const P_LEADER_SPEED: usize = 18;
 const P_TURB: usize = 19; // rms turbulent velocity (m/s)
 const P_EDDY: usize = 20; // largest eddy size (m)
 const P_DIFFUSE: usize = 21; // small-scale (mist) diffusivity (m²/s)
-const N_PARAMS: usize = 22;
+const P_SMOKE: usize = 22; // number of smoke puffs
+const P_CLOUDS: usize = 23; // number of cloud puffs
+const N_PARAMS: usize = 24;
+const MAX_PUFFS: usize = 400;
+
+/// A smoke or cloud puff carried by the chamber flow.
+#[derive(Clone, Copy)]
+struct Puff {
+    p: V3,
+    r0: f32,
+    age: f32,
+    life: f32,
+    rot: f32,
+    spin: f32,
+    cloud: bool,
+    seed: f32,
+}
 
 struct Grid {
     dims: [usize; 3],
@@ -362,6 +383,8 @@ struct Sim {
     fdims: [usize; 3],
     fcell: V3,
     flow_frame: u32,
+    puffs: Vec<Puff>,
+    puff_out: Vec<f32>,
 }
 
 static mut SIM: Option<Sim> = None;
@@ -422,6 +445,8 @@ impl Sim {
         p[P_TURB] = 35.0;
         p[P_EDDY] = 1400.0;
         p[P_DIFFUSE] = 40.0;
+        p[P_SMOKE] = 110.0;
+        p[P_CLOUDS] = 45.0;
         p[P_FLOW] = 0.15;
         let mut s = Sim {
             rng: Rng(0x853c49e6748fea9b ^ ((seed as u64) << 21 | seed as u64)),
@@ -454,6 +479,8 @@ impl Sim {
             fdims: [2, 2, 2],
             fcell: [1.0; 3],
             flow_frame: 0,
+            puffs: Vec::new(),
+            puff_out: vec![0.0; MAX_PUFFS * 8],
         };
         let yref = lightning_color(30000.0).1;
         for i in 0..LUT_N {
@@ -1210,6 +1237,7 @@ impl Sim {
             self.build_flow();
         }
         self.build_grid();
+        self.update_puffs(dt);
         let want = (self.p[P_BOLTS] as usize).clamp(0, MAX_BOLTS);
         let mains = self.bolts.iter().filter(|b| !b.bridge).count();
         self.spawn_t -= dt;
@@ -1250,6 +1278,104 @@ impl Sim {
             b.compacted = false;
         }
         self.emit()
+    }
+
+    // ------------------------------------------------------------ smoke & clouds
+    fn new_puff(&mut self, cloud: bool) -> Puff {
+        let h = self.half;
+        let mut p = if cloud {
+            [self.rng.range(-0.95, 0.95) * h[0], self.rng.range(0.25, 0.9) * h[1], self.rng.range(-0.9, 0.9) * h[2]]
+        } else {
+            [self.rng.range(-0.9, 0.9) * h[0], self.rng.range(-0.9, 0.6) * h[1], self.rng.range(-0.85, 0.85) * h[2]]
+        };
+        // some smoke rises from the hot lightning channels (heated, buoyant air)
+        if !cloud && self.rng.f() < 0.45 && !self.bolts.is_empty() {
+            let b = &self.bolts[(self.rng.f() * self.bolts.len() as f32) as usize % self.bolts.len()];
+            if !b.nodes.is_empty() {
+                let nd = b.nodes[(self.rng.f() * b.nodes.len() as f32) as usize % b.nodes.len()];
+                if nd.alive && nd.temp > 3000.0 {
+                    p = nd.p;
+                }
+            }
+        }
+        Puff {
+            p,
+            r0: if cloud { self.rng.range(150.0, 320.0) } else { self.rng.range(50.0, 120.0) },
+            age: 0.0,
+            life: if cloud { self.rng.range(14.0, 30.0) } else { self.rng.range(6.0, 14.0) },
+            rot: self.rng.range(0.0, 2.0 * PI),
+            spin: self.rng.gauss() * 0.15,
+            cloud,
+            seed: self.rng.f(),
+        }
+    }
+
+    fn update_puffs(&mut self, dt: f32) {
+        let ns = (self.p[P_SMOKE] as usize).min(MAX_PUFFS / 2);
+        let nc = (self.p[P_CLOUDS] as usize).min(MAX_PUFFS / 2);
+        let h = self.half;
+        // keep the requested counts (staggered ages so they don't all fade together)
+        let (mut have_s, mut have_c) = (0, 0);
+        for pf in self.puffs.iter() {
+            if pf.cloud { have_c += 1 } else { have_s += 1 }
+        }
+        while have_s > ns {
+            if let Some(i) = self.puffs.iter().position(|q| !q.cloud) { self.puffs.swap_remove(i); }
+            have_s -= 1;
+        }
+        while have_c > nc {
+            if let Some(i) = self.puffs.iter().position(|q| q.cloud) { self.puffs.swap_remove(i); }
+            have_c -= 1;
+        }
+        for _ in have_s..ns {
+            let mut q = self.new_puff(false);
+            q.age = self.rng.f() * q.life;
+            self.puffs.push(q);
+        }
+        for _ in have_c..nc {
+            let mut q = self.new_puff(true);
+            q.age = self.rng.f() * q.life;
+            self.puffs.push(q);
+        }
+        for i in 0..self.puffs.len() {
+            let q = self.puffs[i];
+            let v = self.velocity(q.p);
+            // clouds drift slower and stay in the upper layer; smoke rises gently (buoyancy)
+            let (vk, rise) = if q.cloud { (0.6, (0.55 * h[1] - q.p[1]) * 0.02) } else { (1.0, 6.0) };
+            let mut np = add(q.p, mul([v[0] * vk, v[1] * vk + rise, v[2] * vk], dt));
+            for a in 0..3 {
+                np[a] = np[a].clamp(-h[a], h[a]);
+            }
+            // local rotation from the flow (finite-difference vorticity about the view axis)
+            let e = 60.0;
+            let vx_up = self.velocity(add(q.p, [0.0, e, 0.0]))[0];
+            let vy_right = self.velocity(add(q.p, [e, 0.0, 0.0]))[1];
+            let wz = (vy_right - v[1]) / e - (vx_up - v[0]) / e;
+            let pm = &mut self.puffs[i];
+            pm.p = np;
+            pm.rot += (0.5 * wz + pm.spin) * dt;
+            pm.age += dt;
+            if pm.age > pm.life {
+                let cl = pm.cloud;
+                self.puffs[i] = self.new_puff(cl);
+            }
+        }
+        // output: [x, y, z, radius, opacity, rotation, kind, seed]
+        for (i, q) in self.puffs.iter().enumerate() {
+            // turbulent diffusion spreads the puff: r² = r0² + 4·D·t; mass conserved → ρ ∝ (r0/r)²
+            let d = if q.cloud { 220.0 } else { 380.0 };
+            let r = (q.r0 * q.r0 + 4.0 * d * q.age).sqrt();
+            let u = q.age / q.life;
+            let fade = smoothstep(0.0, 0.15, u) * (1.0 - smoothstep(0.65, 1.0, u));
+            let dens = fade * (q.r0 / r).powi(2) * if q.cloud { 0.75 } else { 0.45 };
+            let o = i * 8;
+            self.puff_out[o..o + 3].copy_from_slice(&q.p);
+            self.puff_out[o + 3] = r;
+            self.puff_out[o + 4] = dens;
+            self.puff_out[o + 5] = q.rot;
+            self.puff_out[o + 6] = if q.cloud { 1.0 } else { 0.0 };
+            self.puff_out[o + 7] = q.seed;
+        }
     }
 
     fn emit(&mut self) -> u32 {
@@ -1408,6 +1534,14 @@ pub extern "C" fn step(dt: f32) -> u32 {
 #[no_mangle]
 pub extern "C" fn seg_ptr() -> *const f32 {
     sim().out.as_ptr()
+}
+#[no_mangle]
+pub extern "C" fn puff_ptr() -> *const f32 {
+    sim().puff_out.as_ptr()
+}
+#[no_mangle]
+pub extern "C" fn puff_count() -> u32 {
+    sim().puffs.len() as u32
 }
 #[no_mangle]
 pub extern "C" fn blob_ptr() -> *const f32 {

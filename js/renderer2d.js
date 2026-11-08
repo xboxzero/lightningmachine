@@ -20,6 +20,92 @@ export class Renderer2D {
     this.fallback = true;
     this.scale = 1; this.w = this.h = 0;
     this.paths = [];
+    this.sprites = this._smokeSprites();
+    this.tints = new Map();
+  }
+
+  /** Wispy smoke sprites: Gaussian blob × fractal noise (a few variants). */
+  _smokeSprites() {
+    const out = [], S = 128;
+    const hash = (x, y, k) => { const v = Math.sin(x * 127.1 + y * 311.7 + k * 74.7) * 43758.5453; return v - Math.floor(v); };
+    const noise = (x, y, k) => {
+      const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+      const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+      const a = hash(xi, yi, k), b = hash(xi + 1, yi, k), c = hash(xi, yi + 1, k), d = hash(xi + 1, yi + 1, k);
+      return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+    };
+    for (let k = 0; k < 6; k++) {
+      const cv = document.createElement('canvas'); cv.width = cv.height = S;
+      const g = cv.getContext('2d'), img = g.createImageData(S, S);
+      for (let y = 0; y < S; y++)
+        for (let x = 0; x < S; x++) {
+          const dx = (x - S / 2) / (S / 2), dy = (y - S / 2) / (S / 2), r2 = dx * dx + dy * dy;
+          let n = 0, a = 0.5, f = 3;
+          for (let o = 0; o < 4; o++) { n += a * noise(x / S * f, y / S * f, k * 13 + o); f *= 2.1; a *= 0.5; }
+          const d = Math.exp(-r2 * 3.2) * Math.max(0, Math.min(1, (n - 0.25) * 2.2));
+          const i = (y * S + x) * 4;
+          img.data[i] = img.data[i + 1] = img.data[i + 2] = 255;
+          img.data[i + 3] = Math.round(255 * d);
+        }
+      g.putImageData(img, 0, 0);
+      out.push(cv);
+    }
+    return out;
+  }
+
+  _tinted(k, r, g, b) {
+    const key = `${k}|${r}|${g}|${b}`;
+    let cv = this.tints.get(key);
+    if (cv) return cv;
+    if (this.tints.size > 300) this.tints.clear();
+    const src = this.sprites[k];
+    cv = document.createElement('canvas'); cv.width = src.width; cv.height = src.height;
+    const c = cv.getContext('2d');
+    c.drawImage(src, 0, 0);
+    c.globalCompositeOperation = 'source-in';
+    c.fillStyle = `rgb(${r},${g},${b})`;
+    c.fillRect(0, 0, cv.width, cv.height);
+    this.tints.set(key, cv);
+    return cv;
+  }
+
+  /** Smoke and cloud puffs, back to front: dark absorbing body + light from the discharge. */
+  _puffs(s) {
+    if (!s.puffCount) return;
+    const ctx = this.ctx, { vp, pxPerM } = s.cam, P = s.puffs;
+    const list = [];
+    for (let i = 0; i < s.puffCount; i++) {
+      const o = i * 8;
+      if (P[o + 4] < 0.004) continue;
+      const pr = this._proj(vp, P[o], P[o + 1], P[o + 2]);
+      if (!pr) continue;
+      list.push([pr[2], pr[0], pr[1], o]);
+    }
+    list.sort((a, b) => b[0] - a[0]);
+    const L = s.light, lc = s.lightColor;
+    const lr = enc(lc[0]) >> 4 << 4, lg = enc(lc[1]) >> 4 << 4, lb = enc(lc[2]) >> 4 << 4;
+    for (const [depth, x, y, o] of list) {
+      const r = P[o + 3], dens = P[o + 4] * s.smoke, rot = P[o + 5], cloud = P[o + 6] > 0.5, k = Math.floor(P[o + 7] * 6) % 6;
+      const size = r * 2.4 * pxPerM / depth;
+      if (size < 2) continue;
+      // illumination by the discharge: inverse-square-like falloff from the light centroid
+      const dx = P[o] - L[0], dy = P[o + 1] - L[1], dz = P[o + 2] - L[2];
+      const ill = L[3] * 2.2e5 / (dx * dx + dy * dy + dz * dz + 2.5e5);
+      const c = Math.cos(rot), sn = Math.sin(rot);
+      ctx.setTransform(c, sn, -sn, c, x, y);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = Math.min(0.9, dens * (cloud ? 0.9 : 0.75));
+      ctx.drawImage(this._tinted(k, cloud ? 34 : 26, cloud ? 36 : 28, cloud ? 44 : 34), -size / 2, -size / 2, size, size);
+      const lit = Math.min(1, dens * (0.06 + ill) * 1.6);
+      if (lit > 0.01) {
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = lit;
+        ctx.drawImage(this._tinted(k, lr, lg, lb), -size / 2, -size / 2, size, size);
+      }
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
   }
   setLUT(data, n, tmin, tmax) { this.lut = { data, n, tmin, tmax }; }
   setBlackbody(data, n, tmin, tmax) { this.bb = { data, n, tmin, tmax }; }
@@ -103,6 +189,7 @@ export class Renderer2D {
       if (a && b) { ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); }
     }
     ctx.stroke();
+    this._puffs(s);
     if (!s.segCount) return;
     ctx.globalCompositeOperation = 'lighter';
     // reflections in the glass walls (method of images), clipped to the projected wall quad;

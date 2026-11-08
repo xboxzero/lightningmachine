@@ -6,11 +6,11 @@ const $ = (s) => document.querySelector(s);
 // parameter ids — must match core/src/lib.rs
 const P = { bolts: 0, blobs: 1, heat: 2, flow: 3, eta: 4, quantum: 5, betaLog: 6, workFn: 7, branch: 8, connect: 9,
   ipeak: 10, icc: 11, restrike: 12, slowmo: 13, life: 14, crackle: 15, tension: 16, mic: 17, leader: 18,
-  turb: 19, eddy: 20, diffuse: 21 };
+  turb: 19, eddy: 20, diffuse: 21, smoke: 22, clouds: 23 };
 
 let wasm, renderer;
 const sound = new Sound();
-const ui = { gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 1, mist: 0.3, autoQuality: true, sway: 1, soundOn: false, micOn: false };
+const ui = { smoke: 1, gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 1, mist: 0.3, autoQuality: true, sway: 1, soundOn: false, micOn: false };
 const HY = 1000, HZ = 900, FOV = 50 * Math.PI / 180;
 const view = { dragX: 0, dragY: 0 };
 
@@ -30,6 +30,9 @@ const controls = [
   { sec: 'Quantum tunnelling', id: 'quantum', label: 'WKB tunnelling weight', min: 0, max: 1, step: 0.01, v: 0.25, p: P.quantum },
   { sec: 'Quantum tunnelling', id: 'betaLog', label: 'Field enhancement log₁₀β', min: 3, max: 5.5, step: 0.05, v: 4.4, p: P.betaLog },
   { sec: 'Quantum tunnelling', id: 'workFn', label: 'Work function φ (eV)', min: 2, max: 7, step: 0.05, v: 4.5, p: P.workFn },
+  { sec: 'Smoke & mist motion', id: 'smokeN', label: 'Smoke puffs', min: 0, max: 200, step: 1, v: 110, p: P.smoke },
+  { sec: 'Smoke & mist motion', id: 'cloudN', label: 'Cloud puffs', min: 0, max: 200, step: 1, v: 45, p: P.clouds },
+  { sec: 'Smoke & mist motion', id: 'smokeK', label: 'Smoke density', min: 0, max: 2.5, step: 0.05, v: 1, ui: 'smoke' },
   { sec: 'Smoke & mist motion', id: 'turb', label: 'Turbulence (rms m/s)', min: 0, max: 250, step: 1, v: 35, p: P.turb },
   { sec: 'Smoke & mist motion', id: 'eddy', label: 'Largest eddy (m)', min: 300, max: 4000, step: 50, v: 1400, p: P.eddy },
   { sec: 'Smoke & mist motion', id: 'diffuse', label: 'Mist diffusion (m²/s)', min: 0, max: 400, step: 5, v: 40, p: P.diffuse },
@@ -230,6 +233,7 @@ function frame(now) {
     segs: f32(wasm.seg_ptr(), Math.max(1, n) * 8), segCount: n,
     light: [info[3], info[4], info[5], act], lightColor: [lc[0], lc[1], lc[2]],
     blobPos, blobCol, nBlobs: 0, lava: 0,
+    puffs: f32(wasm.puff_ptr(), Math.max(1, wasm.puff_count()) * 8), puffCount: wasm.puff_count(), smoke: ui.smoke,
     reflect: ui.reflect, reflections: perf.reflections, mist: ui.mist, gain: ui.gain, thickness: ui.thickness, bloom: ui.bloom,
   });
   requestAnimationFrame(frame);
