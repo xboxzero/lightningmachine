@@ -1,38 +1,39 @@
-# ⚡ Lightning Machine — real-time 4D lightning simulation
+# ⚡ Lightning Machine — lightning in a glass chamber
 
 Live: **https://xboxzero.github.io/lightningmachine/**
 
-A real-time lightning simulation in 3D space plus time. It has surround thunder, an on-screen and gamepad controller, several camera views, a fullscreen button and microphone control.
-The physics runs in **Rust compiled to WebAssembly (SIMD)**. That is the fastest, lowest-latency option that runs in a browser.
-Rendering is **WebGL2 HDR** and audio is **Web Audio**. Thunder is synthesised in a **Web Worker**, so the frame loop never stalls.
+Your screen is the front glass of a dark chamber. Inside, real-physics lightning grows, strikes, re-strikes, links up with neighbouring bolts, and slowly folds around in 3D on a lava-lamp-style convection flow. The viewpoint drifts on its own, and the perspective is always corrected so the screen behaves like a window into the box.
 
-## Physics and maths (`core/src/lib.rs`)
-
-| Part | Model |
+## Physics and maths (Rust → WebAssembly, `core/src/lib.rs`)
+| | Model |
 |---|---|
-| Electric field | Poisson equation ∇²φ = −ρ/ε₀ on a 3-D lattice, solved by red-black SOR. The cloud base has a Gaussian potential profile, the ground is φ = 0 and the lower positive charge region is a Gaussian space charge. |
-| Stepped leader | Dielectric Breakdown Model (Niemeyer–Pietronero–Wiesmann): P ∝ \|∇φ\|^η over 26-neighbour candidates. Each step adds log-normal (Gaussian) space-charge noise. Node positions get a Gaussian jitter and a Gaussian midpoint displacement. |
-| Quantum tunnelling | Fowler–Nordheim field emission with Murphy–Good barrier functions (Forbes approximation). The WKB transmission T = exp(−v(f)·bφ^{3/2}/F) weights each breakdown site, and sites are sampled by the Born rule, P ∝ \|ψ\|² ∝ T. The emitted current density J sets the leader's stepping rate. The local field includes a field-enhancement factor β. |
-| Attachment | Contact with the ground, or a grounded tower within striking distance (upward connecting leader). |
-| Return stroke | Heidler current function with IEC 62305-1 waveforms (1/200 µs first stroke, 0.25/100 µs later strokes). It travels up the channel by the MTLE model at v = 1.2×10⁸ m/s with λ = 2 km. Peak currents come from the CIGRE log-normal distributions. Flashes have several strokes, dart leaders and continuing current. |
-| Temperature | Joule-heating equilibrium T ∝ √I, so radiance σT⁴ ∝ I². The channel then cools exponentially. |
-| Colour | Planck's law integrated against the CIE 1931 2° colour-matching functions (Wyman–Sloan–Shirley multi-lobe Gaussian fit), then XYZ → linear sRGB (D65). This is precomputed as a lookup table from 800 K to 40,000 K. |
-| Thunder | Few's blast-wave theory: R₀ = √(E_l/πp₀) and N-wave fundamental f = 0.63c/R₀. It adds weak-shock lengthening, sinc directivity for tortuous micro-segments, 1/r spreading, a ground image source and range-dependent rise time. |
-| Moving 3-D thunder | Thunder is synthesised into 12 world-fixed directional stems (8 around the horizon, 4 overhead). Each plays through a Web Audio HRTF panner, and the listener turns with the camera, so the rumble rolls along the channel and swings around you as you look around. Each clip starts at the first arrival (distance ÷ 343 m/s). Absorption grows with range (near strikes crack, distant ones rumble), and an outdoor reverberation tail is added. |
-| Wind drift | Between strokes the hot channel drifts in the wind ("ribbon lightning"). The mean wind follows a logarithmic boundary-layer profile u(z) ∝ ln(z/z₀). Gusts are divergence-free kinematic-simulation turbulence with a Kolmogorov −5/3 spectrum. |
-| Surround (legacy) | 2-D VBAP for 5.1 (L, R, C, LFE, Ls, Rs, with a bass-managed LFE). Stereo and headphones use constant-power panning plus Woodworth ITD. Playback is offset by the synthesis latency, so thunder arrives exactly at distance / 343 m/s. |
-
-## Compatibility
-Without WebGL2 (hardware acceleration off, blocked GPU, older browser), a Canvas 2D storm renderer is used automatically. It draws the same scene: flash-lit clouds, ground, rain, tower and black-body-coloured lightning.
+| **Charge cells** | Invisible buoyant cells, heated at the floor and cooled at the ceiling (Newtonian heating, Boussinesq buoyancy, Stokes drag). Their charge follows thermionic emission (Richardson–Dushman J = A T² e^{−W/kT}): hot rising cells turn positive and cold sinking cells stay negative. |
+| **Electric field** | Coulomb's law with softened charges, E = k Σ q (x − x_q)/(r² + a²)^{3/2} in V/m. |
+| **Quantum tunnelling** | Fowler–Nordheim field emission with Murphy–Good barrier functions: ln T_WKB = −v(f)·bφ^{3/2}/F, J = (a/φt²)F²T, with F = β|E|. The tunnelling probability weights every breakdown step, and J sets how fast the leader steps. |
+| **Stepped leader** | 3-D stochastic dielectric breakdown. Candidate steps are weighted by (d̂·Ê)^η × T_WKB^w × e^{σN} and one is picked by the Born rule (P ∝ \|ψ\|²). Tips fork at random. |
+| **Connections** | Leader tips attach to positive cells **or to any existing channel** (found with a spatial hash). Hot channels of different bolts that drift close together get bridging leaders. When one channel is hit by another, it re-strikes. |
+| **Return stroke** | Heidler current function (IEC 62305-1), MTLE propagation at 1.2×10⁸ m/s, CIGRE peak-current statistics, re-strikes and continuing current. Temperature T = 4000 + 26000·(I/30 kA)^0.12. |
+| **Colour** | From the colour temperature of the air plasma: N II, O II, N I, O I and H emission lines (Boltzmann excitation × Saha ionisation) plus a recombination continuum, integrated against the CIE 1931 colour tables → sRGB. The channel flashes blue-violet-white, then cools through pink-violet to red. |
+| **Smoke-like motion** | Kinematic-simulation turbulence (Kraichnan; Fung et al. 1992): divergence-free random Fourier modes whose energies follow Kolmogorov's E(k) ∝ k^{−5/3}, each changing at its eddy-turnover rate. This gives random, folding, smoke- or mist-like motion. Added to it: Stokes flow dragged by the charge cells, weak convection rolls, Brownian mist diffusion √(2D·dt), and recirculation where the smoke meets the glass. The velocity field is built with separable complex phasors on a coarse grid, refreshed every other frame, and trilinearly interpolated. Cooling channels widen into soft haze while keeping the same total light. |
+| **Glass** | Off-axis "window" projection (Kooima). Mirror images in the five walls via the method of images, clipped to each wall and weighted by glass Fresnel reflectance (Schlick, n = 1.5, R₀ = 4%). |
 
 ## Controls
-- **Buttons:** ⚡ Strike, 🎥 camera (Orbit, Cinematic, Ground observer, Free fly, Strike-point chase), ⟲ reset, 🎤 Mic, ⏸, 🎮 on-screen joysticks, ☰ panel, ⛶ Fullscreen.
-- **Keys:** Space strike · C camera · F fullscreen · M mic · P pause · H panel · R reset · WASD/QE move · arrows orbit · +/- zoom.
-- **Gamepad:** sticks move/look · LT/RT zoom · LB/RB height · A strike · B camera · X mic · Y panel · D-pad activity/η.
-- **Microphone:** loudness speeds up leader growth and claps trigger strikes. Pitch (spectral centroid) lowers η for more branching and sets the direction of a steering field. The mic is only analysed and never sent to the speakers.
+The buttons in the bottom-right corner hide after 2.5 s of no activity; move the mouse or tap to bring them back.
+- ⚡ strike · ⚙ controller · 🔈 sound · 🎤 mic · ⛶ fullscreen
+- **Drag** to move your eye and look around inside the glass · **tap** to strike
+- **Panel sections:** Lightning · Quantum tunnelling · Chamber flow · Glass & view. Raise *Glass reflection* above 1 for a kaleidoscope-like effect.
+- **Keys:** Space strike · H panel · F fullscreen · S sound · M mic
+
+## Sound
+Each strike's crack and rumble is a 3D (HRTF) source. It starts at the strike point and glides toward the channel's glowing centre as it rumbles, so the thunder moves inside the chamber. The glass chamber adds early wall reflections and a dark diffuse tail. Headphones work best.
+
+## Performance
+Physics takes about 1.3 ms per frame. The renderer caps pixel density at 1.5× and draws reflections in one soft pass. It watches the frame time every half-second, lowering or raising render resolution to hold about 60 fps, and drops reflections only as a last resort.
+
+## Compatibility
+WebGL2 is used when available. Context creation retries with plainer options if the browser rejects the low-latency ones. Without WebGL2 (hardware acceleration off, blocked GPU, old browser) the page switches automatically to a Canvas 2D renderer: same simulation and colours, with simpler glow.
 
 ## Build
 ```bash
-./build.sh   # needs rustup; builds core/ → lightning.wasm
+./build.sh   # Rust → lightning.wasm
 ```
-The site itself is static: `index.html`, `style.css`, `js/` and `lightning.wasm`. Serve it from any web server; it needs HTTP because WebAssembly won't load from `file://`.
