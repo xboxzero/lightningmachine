@@ -19,6 +19,7 @@ precision highp float;
 layout(location=0) in vec3 a_p0; layout(location=1) in vec3 a_p1; layout(location=2) in vec2 a_tw;
 uniform mat4 u_vp; uniform mat4 u_model; uniform vec2 u_res; uniform float u_pxPerM; uniform float u_width; uniform float u_minPx;
 uniform vec3 u_eye;
+uniform sampler2D u_lut; uniform vec2 u_lutRange; uniform float u_mist;
 out float v_across; out float v_T; out float v_gain; out float v_along; flat out float v_L; flat out float v_hw; flat out float v_cap; out vec3 v_world;
 void main(){
   int id = gl_VertexID; float side = (id&1)==0 ? -1.0 : 1.0; bool e0 = id<2;
@@ -32,9 +33,12 @@ void main(){
   vec2 d = s1-s0; float L = length(d); vec2 dir = L>1e-4 ? d/L : vec2(1,0); vec2 n = vec2(-dir.y,dir.x);
   vec4 c = e0 ? c0 : c1;
   float cap = a_tw.y < 0.0 ? 1.0 : 0.0;
-  float wTrue = u_width*abs(a_tw.y)*u_pxPerM/c.w;     // metres → pixels at this depth
+  // cooling channels expand and diffuse into mist (same total light, wider and softer)
+  float B = textureLod(u_lut, vec2(clamp((a_tw.x-u_lutRange.x)/(u_lutRange.y-u_lutRange.x),0.0,1.0),0.5), 0.0).a;
+  float spread = 1.0 + u_mist*3.0*clamp(1.0 - B, 0.0, 1.0);
+  float wTrue = u_width*abs(a_tw.y)*u_pxPerM/c.w*spread;     // metres → pixels at this depth
   float wpx = max(wTrue, u_minPx);
-  v_gain = wTrue/wpx;
+  v_gain = wTrue/wpx/spread;
   float ext = (!e0 && cap > 0.5) ? wpx*1.2 : 0.0;
   vec2 off = n*side*wpx*0.5 + dir*(e0 ? 0.0 : ext);
   c.xy += off/(0.5*u_res)*c.w;
@@ -76,19 +80,13 @@ precision highp float;
 in vec2 v_uv; out vec4 o;
 uniform vec3 u_eye; uniform vec3 u_half; uniform float u_time;
 uniform vec4 u_light; uniform vec3 u_lcol;     // discharge: xyz centroid, w strength
-uniform vec4 u_blobs[12]; uniform vec4 u_bcol[12]; uniform int u_nb;
 float hash(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
 float vnoise(vec3 p){ vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
   return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
              mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z); }
-float fbm(vec3 p){ float s=0.0,a=0.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*2.02+vec3(3.1,1.7,5.3); a*=0.5; } return s; }
 vec3 lightAt(vec3 p, vec3 n){
   vec3 L = u_light.xyz - p; float r2 = dot(L,L);
   vec3 e = u_lcol*u_light.w*max(dot(normalize(L),n),0.0)*6.0e5/(r2+4.0e4);
-  for(int i=0;i<12;i++){ if(i>=u_nb) break;
-    vec3 B = u_blobs[i].xyz - p; float b2 = dot(B,B);
-    e += u_bcol[i].rgb*u_bcol[i].a*max(dot(normalize(B),n),0.0)*u_blobs[i].w*u_blobs[i].w*0.8/(b2+1.0e4);
-  }
   return e;
 }
 void main(){
@@ -104,20 +102,15 @@ void main(){
   if(t == tq.x){ n = vec3(-sign(d.x),0,0); uv = H.zy; }
   else if(t == tq.y){ n = vec3(0,-sign(d.y),0); uv = H.xz; }
   else { n = vec3(0,0,1); uv = H.xy; }
-  // glass wall: very dark tint + a slowly evolving surreal haze, lit by lightning and lava
-  float haze = fbm(vec3(uv*0.0016, u_time*0.03)) ;
-  float warp = fbm(vec3(uv*0.0011 + haze*1.7, u_time*0.02 + 7.0));
-  vec3 base = mix(vec3(0.002,0.002,0.005), vec3(0.008,0.004,0.012), warp) * (0.5 + 0.8*haze);
+  // glass wall: very dark tint with one slow noise layer, lit by the lightning
+  float haze = vnoise(vec3(uv*0.0012, u_time*0.03));
+  vec3 base = mix(vec3(0.002,0.002,0.005), vec3(0.007,0.004,0.011), haze);
   vec3 E = lightAt(H, n);
-  vec3 col = base + E*(0.008 + 0.02*warp*warp);
+  vec3 col = base + E*(0.008 + 0.015*haze);
   // edges of the chamber (where two walls meet): thin glass edges catching light
-  vec3 q = vec3(1.0) - ah;
-  float e1 = min(min(q.x + q.y*10.0*float(ah.y<0.0), 9.0), 9.0);
-  float edge = 0.0;
-  vec3 qq = q * u_half;   // distance to each wall (m)
-  float m1 = min(qq.x, qq.y), m2 = min(qq.y, qq.z), m3 = min(qq.x, qq.z);
+  vec3 qq = (vec3(1.0) - ah) * u_half;   // distance to each wall (m)
   float de = min(min(max(qq.x,qq.y), max(qq.y,qq.z)), max(qq.x,qq.z));
-  edge = exp(-de/6.0);
+  float edge = exp(-de/6.0);
   col += (vec3(0.025,0.03,0.04) + E*0.08) * edge;
   // volumetric glow of the air between the glass and the wall (single scattering, crude)
   vec3 mid = P + d*t*0.5;
@@ -320,7 +313,7 @@ export class Renderer {
 
   resize() {
     const gl = this.gl;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2) * this.scale;
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5) * this.scale;
     const w = Math.max(2, Math.floor(this.canvas.clientWidth * dpr));
     const h = Math.max(2, Math.floor(this.canvas.clientHeight * dpr));
     if (w !== this.w || h !== this.h) {
@@ -329,7 +322,7 @@ export class Renderer {
       for (const o of this.targets || []) { gl.deleteTexture(o.tex); gl.deleteFramebuffer(o.fbo); }
       this.targets = [];
       let mw = w, mh = h;
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 6; i++) {
         const tex = this._tex(mw, mh), fbo = gl.createFramebuffer();
         gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
         gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
@@ -362,9 +355,6 @@ export class Renderer {
     gl.uniform1f(p.u.u_time, s.time);
     gl.uniform4fv(p.u.u_light, s.light);
     gl.uniform3fv(p.u.u_lcol, s.lightColor);
-    gl.uniform4fv(p.u.u_blobs, s.blobPos);
-    gl.uniform4fv(p.u.u_bcol, s.blobCol);
-    gl.uniform1i(p.u.u_nb, s.nBlobs);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     gl.enable(gl.BLEND);
@@ -403,16 +393,19 @@ export class Renderer {
       gl.uniform2fv(p.u.u_lutRange, this.lutRange);
       const H = s.half;
       const views = [[IDENT, [0, 0, 0, 0]]];
-      if (s.reflect > 0) {
+      if (s.reflect > 0 && s.reflections !== false) {
         views.push([mirror(0, H[0]), [1, 0, 0, H[0]]], [mirror(0, -H[0]), [-1, 0, 0, H[0]]],
           [mirror(1, H[1]), [0, 1, 0, H[1]]], [mirror(1, -H[1]), [0, -1, 0, H[1]]], [mirror(2, -H[2]), [0, 0, -1, H[2]]]);
       }
       const k = s.thickness;
+      gl.uniform1f(p.u.u_mist, s.mist);
       for (const [model, plane] of views) {
         gl.uniformMatrix4fv(p.u.u_model, false, model);
         gl.uniform4fv(p.u.u_plane, plane);
         gl.uniform1f(p.u.u_reflect, s.reflect);
-        for (const [wd, mp, g, sh] of [[5 * k, 1.5, 1.3, 2.2], [32 * k, 4.0, 0.08, 2.5]]) {
+        const direct = plane[0] === 0 && plane[1] === 0 && plane[2] === 0;
+        const passes = direct ? [[5 * k, 1.5, 1.3, 2.2], [32 * k, 4.0, 0.08, 2.5]] : [[12 * k, 2.5, 0.5, 2.3]];
+        for (const [wd, mp, g, sh] of passes) {
           gl.uniform1f(p.u.u_width, wd); gl.uniform1f(p.u.u_minPx, mp);
           gl.uniform1f(p.u.u_gain, g * s.gain); gl.uniform1f(p.u.u_sharp, sh);
           gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, s.segCount);

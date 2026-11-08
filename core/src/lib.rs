@@ -6,9 +6,11 @@
 //!   (Newtonian heating/cooling, Boussinesq buoyancy a = g·(T − T_env)/T_env, linear
 //!   Stokes drag). Their charge follows thermionic emission (Richardson–Dushman):
 //!   hot rising blobs turn positive, cold sinking blobs stay negative.
-//! Fluid — the chamber fluid is dragged by the moving blobs: a sum of regularised
-//!   Stokeslets (Cortez 2001), u = (3a/4)[(r²+2ε²)v + (v·d)d]/(r²+ε²)^{3/2}, plus
-//!   Rayleigh–Bénard convection rolls from stream functions. All divergence-free.
+//! Fluid — kinematic-simulation turbulence (Kraichnan/Fung): divergence-free random
+//!   Fourier modes with a Kolmogorov k^{−5/3} spectrum (smoke-like folding), plus the
+//!   Stokes flow dragged by the charge cells (regularised Stokeslets, Cortez 2001) and
+//!   weak Rayleigh–Bénard rolls; sampled on a coarse grid, trilinearly interpolated.
+//!   Small-scale mixing adds Brownian diffusion √(2D·dt).
 //! Electrostatics — E = k Σ q (x − x_q)/(|x − x_q|² + a²)^{3/2}, k = 8.99×10⁹, q in C.
 //! Leader — 3-D stochastic dielectric breakdown: candidate steps weighted by
 //!   (d̂·Ê)^η × T_WKB(F)^w × e^{σN(0,1)}, sampled by the Born rule (P ∝ |ψ|² ∝ weight).
@@ -281,6 +283,15 @@ struct Blob {
     a: f32,    // radius (m)
 }
 
+/// One Fourier mode of the kinematic-simulation turbulence field.
+#[derive(Clone, Copy)]
+struct Mode {
+    k: V3,     // wavevector (rad/m)
+    a: V3,     // cos amplitude, ⟂ k
+    b: V3,     // sin amplitude, ⟂ k
+    omega: f32, // unsteadiness frequency (rad/s)
+}
+
 #[derive(Clone, Copy)]
 struct Link {
     a_uid: u32,
@@ -308,7 +319,10 @@ const P_CRACKLE: usize = 15;
 const P_TENSION: usize = 16;
 const P_MIC: usize = 17;
 const P_LEADER_SPEED: usize = 18;
-const N_PARAMS: usize = 19;
+const P_TURB: usize = 19; // rms turbulent velocity (m/s)
+const P_EDDY: usize = 20; // largest eddy size (m)
+const P_DIFFUSE: usize = 21; // small-scale (mist) diffusivity (m²/s)
+const N_PARAMS: usize = 22;
 
 struct Grid {
     dims: [usize; 3],
@@ -342,6 +356,12 @@ struct Sim {
     kids: Vec<u16>,
     first_child: Vec<i32>,
     restrike_req: Vec<u32>,
+    modes: Vec<Mode>,
+    modes_key: f32,
+    fgrid: Vec<V3>,
+    fdims: [usize; 3],
+    fcell: V3,
+    flow_frame: u32,
 }
 
 static mut SIM: Option<Sim> = None;
@@ -399,6 +419,10 @@ impl Sim {
         p[P_CRACKLE] = 0.45;
         p[P_TENSION] = 0.3;
         p[P_LEADER_SPEED] = 170.0;
+        p[P_TURB] = 70.0;
+        p[P_EDDY] = 1400.0;
+        p[P_DIFFUSE] = 60.0;
+        p[P_FLOW] = 0.4;
         let mut s = Sim {
             rng: Rng(0x853c49e6748fea9b ^ ((seed as u64) << 21 | seed as u64)),
             p,
@@ -424,6 +448,12 @@ impl Sim {
             kids: Vec::new(),
             first_child: Vec::new(),
             restrike_req: Vec::new(),
+            modes: Vec::new(),
+            modes_key: -1.0,
+            fgrid: Vec::new(),
+            fdims: [2, 2, 2],
+            fcell: [1.0; 3],
+            flow_frame: 0,
         };
         let yref = lightning_color(30000.0).1;
         for i in 0..LUT_N {
@@ -527,20 +557,137 @@ impl Sim {
     }
 
     // ------------------------------------------------------------ fluid
-    fn velocity(&self, x: V3) -> V3 {
+    /// Kinematic-simulation turbulence (Kraichnan 1970; Fung, Hunt et al. 1992):
+    /// u(x,t) = Σₙ aₙ cos(kₙ·x + ωₙt) + bₙ sin(kₙ·x + ωₙt), with aₙ, bₙ ⟂ kₙ so ∇·u = 0
+    /// exactly. |kₙ| is log-spaced and the mode energies follow Kolmogorov's
+    /// E(k) ∝ k^{−5/3}; ωₙ ∝ the eddy-turnover rate kₙ·uₙ. The result is the wispy,
+    /// randomly folding motion of smoke or mist.
+    fn ensure_modes(&mut self) {
+        let key = self.p[P_EDDY] + self.p[P_TURB] * 1e-3;
+        if (key - self.modes_key).abs() < 1e-6 && !self.modes.is_empty() {
+            return;
+        }
+        self.modes_key = key;
+        const N: usize = 20;
+        let l_max = self.p[P_EDDY].max(200.0);
+        let l_min = (3.0 * self.fcell[1].max(60.0)).min(l_max * 0.5);
+        let (k0, k1) = (2.0 * PI / l_max, 2.0 * PI / l_min);
+        let mut modes = Vec::with_capacity(N);
+        let mut e_sum = 0.0;
+        for n in 0..N {
+            let kmag = k0 * (k1 / k0).powf(n as f32 / (N - 1) as f32);
+            let dk = kmag * (k1 / k0).ln() / (N - 1) as f32;
+            let e = kmag.powf(-5.0 / 3.0) * dk; // Kolmogorov spectrum
+            e_sum += e;
+            let khat = norm(self.rng.gauss3());
+            let perp = |v: V3, kh: V3| norm(sub(v, mul(kh, dot(v, kh))));
+            let a = perp(self.rng.gauss3(), khat);
+            let b = perp(self.rng.gauss3(), khat);
+            modes.push((mul(khat, kmag), a, b, e));
+        }
+        let u_rms = self.p[P_TURB];
+        self.modes = modes
+            .into_iter()
+            .map(|(k, a, b, e)| {
+                let amp = u_rms * (e / e_sum).sqrt();
+                let kk = len(k);
+                Mode { k, a: mul(a, amp), b: mul(b, amp), omega: 0.5 * kk * amp }
+            })
+            .collect();
+    }
+
+    /// Rebuild the coarse velocity grid: turbulence + blob Stokeslets + convection rolls.
+    fn build_flow(&mut self) {
+        let h = self.half;
+        let cell = 150.0f32;
+        let dims = [((2.0 * h[0] / cell).ceil() as usize + 1).max(2), ((2.0 * h[1] / cell).ceil() as usize + 1).max(2), ((2.0 * h[2] / cell).ceil() as usize + 1).max(2)];
+        self.fdims = dims;
+        self.fcell = [2.0 * h[0] / (dims[0] - 1) as f32, 2.0 * h[1] / (dims[1] - 1) as f32, 2.0 * h[2] / (dims[2] - 1) as f32];
+        self.ensure_modes();
+        let n = dims[0] * dims[1] * dims[2];
+        let mut g = std::mem::take(&mut self.fgrid);
+        g.clear();
+        g.resize(n, [0.0; 3]);
+        let t = self.time;
+        let tscale = 1.0 + 1.5 * self.p[P_MIC];
+        // separable phasors: e^{i(k·x+ωt)} = e^{i kx x}·e^{i ky y}·e^{i(kz z + ωt)}
+        let mut px = vec![(0.0f32, 0.0f32); dims[0]];
+        let mut py = vec![(0.0f32, 0.0f32); dims[1]];
+        let mut pz = vec![(0.0f32, 0.0f32); dims[2]];
+        for m in self.modes.iter() {
+            for i in 0..dims[0] {
+                let x = -h[0] + i as f32 * self.fcell[0];
+                px[i] = ((m.k[0] * x).cos(), (m.k[0] * x).sin());
+            }
+            for j in 0..dims[1] {
+                let y = -h[1] + j as f32 * self.fcell[1];
+                py[j] = ((m.k[1] * y).cos(), (m.k[1] * y).sin());
+            }
+            for kz in 0..dims[2] {
+                let z = -h[2] + kz as f32 * self.fcell[2];
+                let ph = m.k[2] * z + m.omega * t * tscale;
+                pz[kz] = (ph.cos(), ph.sin());
+            }
+            for kz in 0..dims[2] {
+                let (zc, zs) = pz[kz];
+                for j in 0..dims[1] {
+                    let (yc, ys) = py[j];
+                    let (yzc, yzs) = (yc * zc - ys * zs, yc * zs + ys * zc);
+                    let row = dims[0] * (j + dims[1] * kz);
+                    for i in 0..dims[0] {
+                        let (xc, xs) = px[i];
+                        let c = xc * yzc - xs * yzs;
+                        let sn = xc * yzs + xs * yzc;
+                        let u = &mut g[row + i];
+                        u[0] += m.a[0] * c + m.b[0] * sn;
+                        u[1] += m.a[1] * c + m.b[1] * sn;
+                        u[2] += m.a[2] * c + m.b[2] * sn;
+                    }
+                }
+            }
+        }
+        for kz in 0..dims[2] {
+            for j in 0..dims[1] {
+                for i in 0..dims[0] {
+                    let x = [-h[0] + i as f32 * self.fcell[0], -h[1] + j as f32 * self.fcell[1], -h[2] + kz as f32 * self.fcell[2]];
+                    let idx = i + dims[0] * (j + dims[1] * kz);
+                    let mut u = mul(g[idx], tscale);
+                    u = add(u, self.flow_extra(x));
+                    // glass walls: no flow through the glass, and smoke that reaches the
+                    // glass rolls back inward (wall-bounded recirculation)
+                    let urms = self.p[P_TURB] * tscale;
+                    for a in 0..3 {
+                        let d = x[a].abs();
+                        if d > h[a] * 0.7 {
+                            let s = ((d - h[a] * 0.7) / (h[a] * 0.3)).clamp(0.0, 1.0);
+                            let ramp = s * s * (3.0 - 2.0 * s);
+                            if x[a] * u[a] > 0.0 {
+                                u[a] *= 1.0 - ramp;
+                            }
+                            u[a] -= x[a].signum() * urms * 0.8 * ramp;
+                        }
+                    }
+                    g[idx] = u;
+                }
+            }
+        }
+        self.fgrid = g;
+    }
+
+    /// Blob-driven Stokes flow and gentle convection rolls (lava-lamp component).
+    fn flow_extra(&self, x: V3) -> V3 {
         let h = self.half;
         let mut u = [0.0f32; 3];
-        // regularised Stokeslets: the fluid is dragged along by every moving blob
         for b in self.blobs.iter() {
             let d = sub(x, b.p);
             let r2 = dot(d, d);
             let e2 = b.a * b.a;
-            let den = (r2 + e2).powf(1.5);
+            let q = r2 + e2;
+            let den = q * q.sqrt();
             let c1 = (r2 + 2.0 * e2) / den;
             let c2 = dot(b.v, d) / den;
             u = add(u, mul(add(mul(b.v, c1), mul(d, c2)), 0.75 * b.a));
         }
-        // Rayleigh–Bénard rolls from stream functions (x–y roll and y–z roll)
         let flow = self.p[P_FLOW] * (1.0 + 1.5 * self.p[P_MIC]);
         let xx = (x[0] + h[0]) / (2.0 * h[0]);
         let yy = (x[1] + h[1]) / (2.0 * h[1]);
@@ -550,15 +697,37 @@ impl Sim {
         let m1 = (2.0 * PI * zz + ph).cos();
         u[0] += uu * (PI * xx).sin() * (PI * yy).cos() * m1 * (h[0] / h[1]);
         u[1] += -uu * (PI * xx).cos() * (PI * yy).sin() * m1;
-        let m2 = (2.0 * PI * xx + ph).sin() * 0.6;
-        u[1] += uu * (PI * yy).sin() * (PI * zz).cos() * m2;
-        u[2] += -uu * (PI * yy).cos() * (PI * zz).sin() * m2 * (h[2] / h[1]);
-        // glass walls: no flow through the glass
-        for i in 0..3 {
-            let d = x[i].abs();
-            if x[i] * u[i] > 0.0 && d > h[i] * 0.85 {
-                let s = ((h[i] - d) / (h[i] * 0.15)).clamp(0.0, 1.0);
-                u[i] *= s * s * (3.0 - 2.0 * s);
+        u
+    }
+
+    /// Trilinear interpolation of the velocity grid.
+    fn velocity(&self, x: V3) -> V3 {
+        let h = self.half;
+        let d = self.fdims;
+        if self.fgrid.len() != d[0] * d[1] * d[2] {
+            return [0.0; 3];
+        }
+        let mut i0 = [0usize; 3];
+        let mut f = [0.0f32; 3];
+        for a in 0..3 {
+            let g = ((x[a] + h[a]) / self.fcell[a]).clamp(0.0, (d[a] - 1) as f32 - 1e-3);
+            i0[a] = g as usize;
+            f[a] = g - i0[a] as f32;
+        }
+        let idx = |i: usize, j: usize, k: usize| i + d[0] * (j + d[1] * k);
+        let mut u = [0.0f32; 3];
+        for dz in 0..2 {
+            let wz = if dz == 0 { 1.0 - f[2] } else { f[2] };
+            for dy in 0..2 {
+                let wy = if dy == 0 { 1.0 - f[1] } else { f[1] };
+                for dx in 0..2 {
+                    let wx = if dx == 0 { 1.0 - f[0] } else { f[0] };
+                    let v = self.fgrid[idx(i0[0] + dx, i0[1] + dy, i0[2] + dz)];
+                    let w = wx * wy * wz;
+                    u[0] += v[0] * w;
+                    u[1] += v[1] * w;
+                    u[2] += v[2] * w;
+                }
             }
         }
         u
@@ -861,13 +1030,15 @@ impl Sim {
         b.age += dt;
         let ou_k = (-dt / 0.08f32).exp();
         let ou_s = (1.0 - ou_k * ou_k).sqrt() * 0.45;
+        let diff = (2.0 * self.p[P_DIFFUSE] * dt).sqrt();
         for nd in b.nodes.iter_mut() {
             if !nd.alive {
                 continue;
             }
             let v1 = self.velocity(nd.p);
             let v2 = self.velocity(add(nd.p, mul(v1, dt * 0.5)));
-            nd.p = add(nd.p, mul(v2, dt));
+            // advection + small-scale turbulent diffusion (Brownian step √(2D·dt))
+            nd.p = add(add(nd.p, mul(v2, dt)), mul(self.rng.gauss3(), diff));
             for j in 0..3 {
                 nd.p[j] = nd.p[j].clamp(-self.half[j] + 2.0, self.half[j] - 2.0);
                 nd.jit[j] = nd.jit[j] * ou_k + ou_s * self.rng.gauss();
@@ -1033,6 +1204,11 @@ impl Sim {
         self.restrikes = 0;
         self.ensure_blobs();
         self.move_blobs(dt);
+        // eddies evolve slowly: refresh the velocity grid every other frame
+        self.flow_frame = self.flow_frame.wrapping_add(1);
+        if self.flow_frame % 2 == 0 || self.fgrid.is_empty() {
+            self.build_flow();
+        }
         self.build_grid();
         let want = (self.p[P_BOLTS] as usize).clamp(0, MAX_BOLTS);
         let mains = self.bolts.iter().filter(|b| !b.bridge).count();
@@ -1206,6 +1382,7 @@ pub extern "C" fn set_box(hx: f32, hy: f32, hz: f32) {
             }
         }
         s.half = nh;
+        s.fgrid.clear();
     }
 }
 #[no_mangle]

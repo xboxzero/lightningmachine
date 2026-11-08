@@ -5,11 +5,12 @@ import { Sound } from './audio.js';
 const $ = (s) => document.querySelector(s);
 // parameter ids — must match core/src/lib.rs
 const P = { bolts: 0, blobs: 1, heat: 2, flow: 3, eta: 4, quantum: 5, betaLog: 6, workFn: 7, branch: 8, connect: 9,
-  ipeak: 10, icc: 11, restrike: 12, slowmo: 13, life: 14, crackle: 15, tension: 16, mic: 17, leader: 18 };
+  ipeak: 10, icc: 11, restrike: 12, slowmo: 13, life: 14, crackle: 15, tension: 16, mic: 17, leader: 18,
+  turb: 19, eddy: 20, diffuse: 21 };
 
 let wasm, renderer;
 const sound = new Sound();
-const ui = { gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 1, sway: 1, soundOn: false, micOn: false };
+const ui = { gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 1, mist: 0.6, autoQuality: true, sway: 1, soundOn: false, micOn: false };
 const HY = 1000, HZ = 900, FOV = 50 * Math.PI / 180;
 const view = { dragX: 0, dragY: 0 };
 
@@ -29,9 +30,13 @@ const controls = [
   { sec: 'Quantum tunnelling', id: 'quantum', label: 'WKB tunnelling weight', min: 0, max: 1, step: 0.01, v: 0.25, p: P.quantum },
   { sec: 'Quantum tunnelling', id: 'betaLog', label: 'Field enhancement log₁₀β', min: 3, max: 5.5, step: 0.05, v: 4.4, p: P.betaLog },
   { sec: 'Quantum tunnelling', id: 'workFn', label: 'Work function φ (eV)', min: 2, max: 7, step: 0.05, v: 4.5, p: P.workFn },
+  { sec: 'Smoke & mist motion', id: 'turb', label: 'Turbulence (rms m/s)', min: 0, max: 250, step: 1, v: 70, p: P.turb },
+  { sec: 'Smoke & mist motion', id: 'eddy', label: 'Largest eddy (m)', min: 300, max: 4000, step: 50, v: 1400, p: P.eddy },
+  { sec: 'Smoke & mist motion', id: 'diffuse', label: 'Mist diffusion (m²/s)', min: 0, max: 400, step: 5, v: 60, p: P.diffuse },
+  { sec: 'Smoke & mist motion', id: 'mist', label: 'Mist haze (cooling glow spread)', min: 0, max: 2, step: 0.05, v: 0.6, ui: 'mist' },
   { sec: 'Chamber flow', id: 'blobs', label: 'Charge cells (invisible)', min: 2, max: 12, step: 1, v: 7, p: P.blobs },
   { sec: 'Chamber flow', id: 'heat', label: 'Convection heat', min: 0, max: 3, step: 0.05, v: 1, p: P.heat },
-  { sec: 'Chamber flow', id: 'flow', label: 'Convection flow', min: 0, max: 3, step: 0.05, v: 1, p: P.flow },
+  { sec: 'Chamber flow', id: 'flow', label: 'Convection rolls', min: 0, max: 3, step: 0.05, v: 0.4, p: P.flow },
   { sec: 'Chamber flow', id: 'tension', label: 'Smoothness', min: 0, max: 1, step: 0.01, v: 0.3, p: P.tension },
   { sec: 'Chamber flow', id: 'crackle', label: 'Crackle', min: 0, max: 1.5, step: 0.01, v: 0.45, p: P.crackle },
   { sec: 'Glass & view', id: 'reflect', label: 'Glass reflection (1 = real glass)', min: 0, max: 12, step: 0.1, v: 1, ui: 'reflect' },
@@ -48,7 +53,7 @@ function buildPanel() {
   for (const c of controls) {
     if (!secs[c.sec]) {
       const d = document.createElement('details');
-      d.open = c.sec === 'Lightning';
+      d.open = c.sec === 'Lightning' || c.sec === 'Smoke & mist motion';
       d.innerHTML = `<summary>${c.sec}</summary>`;
       body.appendChild(d);
       secs[c.sec] = d;
@@ -165,8 +170,23 @@ function setupInput() {
 // ---------------------------------------------------------------- frame loop
 const blobPos = new Float32Array(48), blobCol = new Float32Array(48);
 let last = performance.now();
+// adaptive quality: keep ~60 fps by scaling the render resolution (and dropping wall
+// reflections as a last resort on very slow devices)
+const perf = { avg: 16.7, t: 0, reflections: true };
+function adapt(ms) {
+  ms = Math.min(ms, 250);
+  perf.avg = perf.avg * 0.85 + ms * 0.15;
+  perf.t += ms;
+  if (!ui.autoQuality || perf.t < 500) return;   // re-evaluate every half second
+  perf.t = 0;
+  const minScale = renderer.fallback ? 0.4 : 0.35;
+  if (perf.avg > 20 && renderer.scale > minScale) renderer.scale = Math.max(minScale, renderer.scale * (perf.avg > 40 ? 0.7 : 0.85));
+  else if (perf.avg < 14 && renderer.scale < 1) renderer.scale = Math.min(1, renderer.scale * 1.08);
+  perf.reflections = !(renderer.scale <= minScale + 0.01 && perf.avg > 24);
+}
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
+  adapt(now - last);
   last = now;
   const t = now / 1000;
   const [w, h] = renderer.resize();
@@ -208,7 +228,7 @@ function frame(now) {
     segs: f32(wasm.seg_ptr(), Math.max(1, n) * 8), segCount: n,
     light: [info[3], info[4], info[5], act], lightColor: [lc[0], lc[1], lc[2]],
     blobPos, blobCol, nBlobs: 0, lava: 0,
-    reflect: ui.reflect, gain: ui.gain, thickness: ui.thickness, bloom: ui.bloom,
+    reflect: ui.reflect, reflections: perf.reflections, mist: ui.mist, gain: ui.gain, thickness: ui.thickness, bloom: ui.bloom,
   });
   requestAnimationFrame(frame);
 }
@@ -238,7 +258,7 @@ async function boot() {
   buildPanel();
   setupInput();
   poke();
-  window.__lm = { wasm, togglePanel, ui };
+  window.__lm = { wasm, togglePanel, ui, perf, get renderer() { return renderer; } };
   requestAnimationFrame((tt) => { last = tt; frame(tt); });
 }
 boot();

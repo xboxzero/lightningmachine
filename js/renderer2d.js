@@ -24,7 +24,7 @@ export class Renderer2D {
   setLUT(data, n, tmin, tmax) { this.lut = { data, n, tmin, tmax }; }
   setBlackbody(data, n, tmin, tmax) { this.bb = { data, n, tmin, tmax }; }
   resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 1.5) * this.scale;
+    const dpr = Math.min(window.devicePixelRatio || 1, 1) * this.scale;
     const w = Math.max(2, Math.floor(this.canvas.clientWidth * dpr));
     const h = Math.max(2, Math.floor(this.canvas.clientHeight * dpr));
     if (w !== this.w || h !== this.h) { this.w = w; this.h = h; this.canvas.width = w; this.canvas.height = h; }
@@ -69,7 +69,7 @@ export class Renderer2D {
       const mpx = pxPerM / (P.depth / P.n);          // pixels per metre at this bucket's depth
       const rgb = `${enc(r)},${enc(g)},${enc(b)}`;
       // soft scatter, corona, white-hot core
-      for (const [wm, minPx, a] of [[90, 10, 0.035], [28, 3.5, 0.12], [5, 1.3, 0.85]]) {
+      for (const [wm, minPx, a] of [[30, 4, 0.14], [5, 1.3, 0.85]]) {
         ctx.lineWidth = Math.max(minPx, wm * s.thickness * mpx);
         ctx.strokeStyle = `rgba(${rgb},${Math.min(1, a * B * s.gain * alphaScale)})`;
         ctx.stroke(P.p);
@@ -107,7 +107,7 @@ export class Renderer2D {
     ctx.globalCompositeOperation = 'lighter';
     // reflections in the glass walls (method of images), clipped to the projected wall quad;
     // average Fresnel reflectance of glass at oblique viewing ≈ 0.06
-    if (s.reflect > 0.05) {
+    if (s.reflect >= 2 && s.reflections !== false) {
       const walls = [
         [[-1, 1, 1, 2 * H[0], 0, 0], [[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]]],
         [[-1, 1, 1, -2 * H[0], 0, 0], [[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]]],
