@@ -1,5 +1,5 @@
-// WebGL2 2-D HDR renderer: instanced arc segments with a Gaussian cross-section,
-// plasma orbs, dual-filter bloom and ACES tone mapping.
+// WebGL2 2-D HDR renderer: instanced lightning segments drawn as a Gaussian plasma
+// channel or as a shaded liquid tube (metal / water), dual-filter bloom, ACES tone mapping.
 const FS_TRI = `#version 300 es
 out vec2 v_uv;
 void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); v_uv=p; gl_Position=vec4(p*2.0-1.0,0.0,1.0); }`;
@@ -7,8 +7,8 @@ void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); v_uv=p; gl_Positi
 const ARC_VS = `#version 300 es
 precision highp float;
 layout(location=0) in vec4 a_ab; layout(location=1) in vec4 a_twi;
-uniform vec2 u_res; uniform float u_width; uniform float u_minPx;
-out float v_across; out float v_T; out float v_gain; out float v_along; flat out float v_L; flat out float v_hw; flat out float v_cap;
+uniform vec2 u_res; uniform float u_width; uniform float u_minPx; uniform float u_overlap;
+out float v_across; out float v_T; out float v_gain; out float v_along; flat out float v_L; flat out float v_hw; flat out float v_cap; flat out vec2 v_nrm;
 void main(){
   int id = gl_VertexID; float side = (id&1)==0 ? -1.0 : 1.0; bool e0 = id<2;
   vec2 a = a_ab.xy, b = a_ab.zw; vec2 d = b-a; float L = length(d);
@@ -17,42 +17,54 @@ void main(){
   float wTrue = u_width*abs(a_twi.y);
   float wpx = max(wTrue, u_minPx);
   v_gain = (wTrue/wpx) * a_twi.z;
-  float ext = (!e0 && cap > 0.5) ? wpx*1.2 : wpx*0.3;
-  vec2 p = (e0 ? a : b) + n*side*wpx*0.5 + dir*(e0 ? -wpx*0.3 : ext);
+  // additive passes must not overlap at joints (they would double up into beads);
+  // MAX-blended tubes overlap a little so joints stay seamless
+  float j = u_overlap * wpx;
+  float ext = (!e0 && cap > 0.5) ? wpx*1.2 : j;
+  vec2 p = (e0 ? a : b) + n*side*wpx*0.5 + dir*(e0 ? -j : ext);
   gl_Position = vec4(p/u_res*2.0-1.0, 0.0, 1.0); gl_Position.y = -gl_Position.y;
-  v_across = side; v_T = a_twi.x; v_along = e0 ? -wpx*0.3 : L+ext; v_L = L; v_hw = wpx*0.5; v_cap = cap;
+  v_across = side; v_T = a_twi.x; v_along = e0 ? -j : L+ext; v_L = L; v_hw = wpx*0.5; v_cap = cap; v_nrm = n;
 }`;
 const ARC_FS = `#version 300 es
 precision highp float;
-in float v_across; in float v_T; in float v_gain; in float v_along; flat in float v_L; flat in float v_hw; flat in float v_cap;
+in float v_across; in float v_T; in float v_gain; in float v_along; flat in float v_L; flat in float v_hw; flat in float v_cap; flat in vec2 v_nrm;
 out vec4 o;
-uniform sampler2D u_lut; uniform vec2 u_lutRange; uniform float u_gain, u_sharp;
+uniform sampler2D u_lut; uniform vec2 u_lutRange; uniform float u_gain, u_sharp; uniform int u_style; uniform float u_time;
 void main(){
-  float g = exp(-v_across*v_across*u_sharp);
-  if(v_cap > 0.5){ float d = max(v_along - v_L, 0.0)/max(v_hw,1e-3); g *= exp(-d*d*u_sharp); }
   vec3 c = texture(u_lut, vec2(clamp((v_T-u_lutRange.x)/(u_lutRange.y-u_lutRange.x),0.0,1.0),0.5)).rgb;
   float B = pow(v_T/10000.0, 4.0);   // Stefan–Boltzmann: radiance ∝ T⁴
-  o = vec4(c*B*g*v_gain*u_gain, 1.0);
-}`;
-const ORB_VS = `#version 300 es
-precision highp float;
-uniform vec2 u_res; uniform vec3 u_orb; uniform float u_scale;
-out vec2 v_q;
-void main(){
-  vec2 q = vec2(float(gl_VertexID&1), float((gl_VertexID>>1)&1))*2.0-1.0;
-  v_q = q*u_scale;
-  vec2 p = u_orb.xy + q*u_orb.z*u_scale;
-  gl_Position = vec4(p/u_res*2.0-1.0, 0.0, 1.0); gl_Position.y = -gl_Position.y;
-}`;
-const ORB_FS = `#version 300 es
-precision highp float;
-in vec2 v_q; out vec4 o; uniform vec3 u_col; uniform float u_int, u_time;
-void main(){
-  float r = length(v_q);
-  float core = smoothstep(1.0, 0.85, r);                // the terminal itself
-  float halo = exp(-r*r*0.9)*0.6 + exp(-r*0.9)*0.15;  // corona glow
-  float flick = 0.85 + 0.15*sin(u_time*90.0 + r*7.0);
-  o = vec4(u_col*(core*3.0*u_int + halo*u_int*flick), 1.0);
+  float dEnd = v_cap > 0.5 ? max(v_along - v_L, 0.0)/max(v_hw,1e-3) : 0.0;
+  if(u_style == 0){
+    float g = exp(-v_across*v_across*u_sharp) * exp(-dEnd*dEnd*u_sharp);
+    o = vec4(c*B*g*v_gain*u_gain, 1.0);
+    return;
+  }
+  // tube shading: treat the strand as a cylinder (round end caps on termini)
+  float r = sqrt(v_across*v_across + dEnd*dEnd);
+  if(r >= 1.0) discard;
+  float nz = sqrt(1.0 - r*r);                       // surface normal toward the viewer
+  float vis = smoothstep(1300.0, 4500.0, v_T);      // vanishes as the channel cools
+  float shift = 0.25*sin(u_time*1.7 + dot(gl_FragCoord.xy, vec2(0.006, 0.009)));
+  // screen-space surface normal of the tube; "up" = toward the top of the screen
+  vec2 N2 = v_nrm * v_across;
+  float up = -N2.y;
+  vec3 col;
+  if(u_style == 1){
+    // liquid metal (chrome): bright sky above the horizon, dark ground below,
+    // a sharp horizon line and a moving specular glint, tinted by the glow colour
+    float env = mix(0.04, 0.95, smoothstep(-0.10, 0.30, up + shift*0.3));
+    float horizon = 0.9*exp(-pow((up - 0.06 - shift*0.2)/0.05, 2.0));
+    float spec = 1.6*pow(max(0.0, 1.0 - length(vec2(N2.x + 0.25, up - 0.45))*2.2), 3.0);
+    float refl = (env*(0.45 + 0.55*nz) + horizon) * (0.35 + 0.65*pow(1.0 - nz, 0.35)) + spec + 0.05;
+    col = mix(vec3(0.80,0.83,0.90), c, 0.3) * refl + c*min(B,6.0)*0.05*nz;
+  } else {
+    // water: dark transparent body, bright Fresnel rim and a glint
+    float fres = pow(1.0 - nz, 3.0);
+    float spec = 1.4*pow(max(0.0, 1.0 - length(vec2(N2.x + 0.3, up - 0.4))*2.5), 3.0);
+    col = vec3(0.06,0.25,0.45)*(0.3 + 0.7*smoothstep(-0.5, 0.6, up)) + vec3(0.55,0.85,1.0)*fres*1.4 + vec3(spec) + c*min(B,6.0)*0.03;
+  }
+  float aa = smoothstep(1.0, 0.82, r);
+  o = vec4(col*aa*vis*u_gain, 1.0);
 }`;
 const DOWN_FS = `#version 300 es
 precision highp float;
@@ -124,7 +136,6 @@ export class Renderer {
     gl.getExtension('OES_texture_float_linear');
     this.fmt = floatOK ? { i: gl.RGBA16F, t: gl.HALF_FLOAT } : { i: gl.RGBA8, t: gl.UNSIGNED_BYTE };
     this.arc = compile(gl, ARC_VS, ARC_FS);
-    this.orb = compile(gl, ORB_VS, ORB_FS);
     this.down = compile(gl, FS_TRI, DOWN_FS);
     this.up = compile(gl, FS_TRI, UP_FS);
     this.comp = compile(gl, FS_TRI, COMP_FS);
@@ -214,26 +225,22 @@ export class Renderer {
       gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
       gl.uniform1i(p.u.u_lut, 0);
       gl.uniform2fv(p.u.u_lutRange, this.lutRange);
-      for (const [wd, mp, g, sh] of [
-        [2.2 * px * s.thickness, 1.3, 0.55, 2.2], // white-hot core
-        [14 * px * s.thickness, 4.0, 0.05, 2.5],  // corona
-      ]) {
+      gl.uniform1f(p.u.u_time, s.time);
+      const passes = s.style === 0
+        ? [[0, 2.4 * px * s.thickness, 1.3, 0.55, 2.2], // white-hot core
+           [0, 15 * px * s.thickness, 4.0, 0.05, 2.5]]  // corona
+        : [[0, 22 * px * s.thickness, 4.0, 0.008, 2.0],  // faint electric glow behind it
+           [s.style, 13 * px * s.thickness, 3.0, 1.0, 0]]; // liquid tube (MAX blend: seamless joints)
+      for (const [style, wd, mp, g, sh] of passes) {
+        gl.blendEquation(style === 0 ? gl.FUNC_ADD : gl.MAX);
+        gl.uniform1i(p.u.u_style, style);
+        gl.uniform1f(p.u.u_overlap, style === 0 ? 0.0 : 0.3);
         gl.uniform1f(p.u.u_width, wd); gl.uniform1f(p.u.u_minPx, mp);
         gl.uniform1f(p.u.u_gain, g * s.gain); gl.uniform1f(p.u.u_sharp, sh);
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, s.segCount);
       }
+      gl.blendEquation(gl.FUNC_ADD);
     }
-    // plasma orbs (terminals)
-    const p = this.orb;
-    gl.useProgram(p.p);
-    gl.bindVertexArray(this.emptyVao);
-    gl.uniform2f(p.u.u_res, w, h);
-    gl.uniform3fv(p.u.u_col, s.orbColor);
-    gl.uniform1f(p.u.u_time, s.time);
-    gl.uniform1f(p.u.u_scale, 4.0);
-    gl.uniform1f(p.u.u_int, 1.2 + s.activity * 0.8);
-    for (const o of s.orbs) { gl.uniform3f(p.u.u_orb, o[0], o[1], o[2]); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
-
     // bloom: downsample chain, then additive tent upsample
     gl.disable(gl.BLEND);
     gl.useProgram(this.down.p);

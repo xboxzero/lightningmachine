@@ -3,27 +3,28 @@ import { Sound } from './audio.js';
 
 const $ = (s) => document.querySelector(s);
 // parameter ids — must match core/src/lib.rs
-const P = { mode: 0, arcs: 1, reach: 2, branch: 3, speed: 4, temp: 5, rate: 6, mic: 7, jag: 8, glow: 9 };
+const P = { bolts: 0, flow: 1, vort: 2, crackle: 3, branch: 4, temp: 5, life: 6, mic: 7, tension: 8, restrike: 9 };
 
 let wasm, renderer;
 const sound = new Sound();
-const ui = { gain: 1, thickness: 1, bloom: 1.0, rate: 60, temp: 26000, vol: 0.6, soundOn: false, micOn: false };
+const ui = { temp: 30000, gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, style: 0, soundOn: false, micOn: false };
 const ptr = { x: 0, y: 0, down: false };
 
 const f32 = (p, n) => new Float32Array(wasm.memory.buffer, p, n);
 
 const controls = [
-  { id: 'arcs', label: 'Arcs', min: 1, max: 30, step: 1, v: 10, p: P.arcs },
-  { id: 'reach', label: 'Reach', min: 0.1, max: 1.2, step: 0.01, v: 0.55, p: P.reach },
-  { id: 'branch', label: 'Branching', min: 0, max: 1.5, step: 0.01, v: 0.5, p: P.branch },
-  { id: 'jag', label: 'Jaggedness', min: 0.1, max: 1.2, step: 0.01, v: 0.55, p: P.jag },
-  { id: 'speed', label: 'Movement speed', min: 0, max: 4, step: 0.05, v: 1, p: P.speed },
-  { id: 'rate', label: 'Firing rate (Hz)', min: 5, max: 200, step: 1, v: 60, p: P.rate, ui: 'rate' },
-  { id: 'temp', label: 'Temperature (K)', min: 3000, max: 40000, step: 100, v: 26000, p: P.temp, ui: 'temp' },
-  { id: 'glow', label: 'Afterglow (ms)', min: 3, max: 200, step: 1, v: 40, p: P.glow },
+  { id: 'bolts', label: 'Bolts', min: 1, max: 16, step: 1, v: 5, p: P.bolts },
+  { id: 'flow', label: 'Flow speed', min: 0, max: 3, step: 0.05, v: 1, p: P.flow },
+  { id: 'vort', label: 'Swirls', min: 1, max: 20, step: 1, v: 8, p: P.vort },
+  { id: 'tension', label: 'Smoothness (surface tension)', min: 0, max: 1, step: 0.01, v: 0.3, p: P.tension },
+  { id: 'crackle', label: 'Crackle', min: 0, max: 1.5, step: 0.01, v: 0.6, p: P.crackle },
+  { id: 'branch', label: 'Branching', min: 0, max: 1.5, step: 0.01, v: 0.6, p: P.branch },
+  { id: 'restrike', label: 'Re-strikes / s', min: 0, max: 4, step: 0.05, v: 0.6, p: P.restrike },
+  { id: 'life', label: 'Bolt lifetime (s)', min: 2, max: 30, step: 0.5, v: 9, p: P.life },
+  { id: 'temp', label: 'Temperature (K)', min: 3000, max: 40000, step: 100, v: 30000, p: P.temp, ui: 'temp' },
   { id: 'gain', label: 'Brightness', min: 0.1, max: 3, step: 0.01, v: 1, ui: 'gain' },
   { id: 'thickness', label: 'Thickness', min: 0.3, max: 3, step: 0.05, v: 1, ui: 'thickness' },
-  { id: 'vol', label: 'Volume', min: 0, max: 1.5, step: 0.01, v: 0.6, ui: 'vol', fn: (x) => sound.setVolume(x) },
+  { id: 'vol', label: 'Volume', min: 0, max: 1.5, step: 0.01, v: 0.7, ui: 'vol', fn: (x) => sound.setVolume(x) },
 ];
 
 function buildPanel() {
@@ -72,27 +73,38 @@ function toggleFullscreen() {
 async function toggleSound() {
   if (!ui.soundOn) { await sound.start(); sound.setVolume(ui.vol); }
   ui.soundOn = !ui.soundOn;
-  if (!ui.soundOn) sound.update(0, ui.rate, 0);
   $('#btn-sound').classList.toggle('on', ui.soundOn);
   $('#btn-sound').textContent = ui.soundOn ? '🔊' : '🔈';
 }
 async function toggleMic() {
-  if (ui.micOn) { sound.disableMic(); ui.micOn = false; wasm.set_param(P.mic, 0); wasm.set_param(P.rate, ui.rate); $('#mic-bar').style.transform = 'scaleX(0)'; }
+  if (ui.micOn) { sound.disableMic(); ui.micOn = false; wasm.set_param(P.mic, 0); $('#mic-bar').style.transform = 'scaleX(0)'; }
   else {
     try { await sound.enableMic(); ui.micOn = true; if (!ui.soundOn) await toggleSound(); }
     catch (e) { alert('Microphone unavailable: ' + e.message); }
   }
   $('#btn-mic').classList.toggle('on', ui.micOn);
 }
-function setMode(m) {
-  wasm.set_param(P.mode, m);
+// liquid looks read best smooth; lightning wants crackle
+const STYLE_PRESET = { 0: { crackle: 0.6, tension: 0.3, bloom: 1.0 }, 1: { crackle: 0.12, tension: 0.7, bloom: 0.35 }, 2: { crackle: 0.12, tension: 0.7, bloom: 0.45 } };
+function setSlider(id, v) {
+  const inp = document.querySelector(`#v-${id}`)?.parentElement.querySelector('input');
+  if (inp) { inp.value = v; inp.dispatchEvent(new Event('input')); }
+}
+function setStyle(m) {
+  const pr = STYLE_PRESET[m];
+  setSlider('crackle', pr.crackle); setSlider('tension', pr.tension); ui.bloom = pr.bloom;
+  ui.style = m;
   document.querySelectorAll('#modes button').forEach((b) => b.classList.toggle('on', +b.dataset.mode === m));
 }
 
 function setupInput() {
   const cv = renderer.canvas;
   const pos = (e) => { const d = renderer.dpr || 1; ptr.x = e.clientX * d; ptr.y = e.clientY * d; };
-  cv.addEventListener('pointerdown', (e) => { pos(e); ptr.down = true; cv.setPointerCapture(e.pointerId); poke(); });
+  cv.addEventListener('pointerdown', (e) => {
+    pos(e); ptr.down = true; cv.setPointerCapture(e.pointerId); poke();
+    wasm.set_pointer(ptr.x, ptr.y, 1);
+    wasm.strike_at(ptr.x, ptr.y); // tap = new bolt from your finger, drag = stir the flow
+  });
   cv.addEventListener('pointermove', (e) => { pos(e); poke(); });
   const up = () => { ptr.down = false; };
   cv.addEventListener('pointerup', up);
@@ -101,20 +113,22 @@ function setupInput() {
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT') return;
     poke();
+    if (e.code === 'Space') { e.preventDefault(); wasm.strike(); }
     if (e.code === 'KeyF') toggleFullscreen();
     if (e.code === 'KeyH' || e.code === 'Escape') togglePanel(e.code === 'Escape' ? false : undefined);
     if (e.code === 'KeyS') toggleSound();
     if (e.code === 'KeyM') toggleMic();
-    if (e.code === 'Digit1') setMode(0);
-    if (e.code === 'Digit2') setMode(1);
-    if (e.code === 'Digit3') setMode(2);
+    if (e.code === 'Digit1') setStyle(0);
+    if (e.code === 'Digit2') setStyle(1);
+    if (e.code === 'Digit3') setStyle(2);
   });
   $('#btn-menu').onclick = () => togglePanel();
   $('#btn-close').onclick = () => togglePanel(false);
   $('#btn-fs').onclick = toggleFullscreen;
   $('#btn-sound').onclick = toggleSound;
   $('#btn-mic').onclick = toggleMic;
-  document.querySelectorAll('#modes button').forEach((b) => (b.onclick = () => setMode(+b.dataset.mode)));
+  $('#btn-strike').onclick = () => wasm.strike();
+  document.querySelectorAll('#modes button').forEach((b) => (b.onclick = () => setStyle(+b.dataset.mode)));
 }
 
 // ---------------------------------------------------------------- frame loop
@@ -125,43 +139,41 @@ function frame(now) {
   const [w, h] = renderer.resize();
   wasm.set_view(w, h);
   wasm.set_pointer(ptr.x, ptr.y, ptr.down ? 1 : 0);
-  let rate = ui.rate;
   if (ui.micOn) {
-    const m = sound.analyse();
+    const m = sound.analyse(now / 1000);
     wasm.set_param(P.mic, m.level);
-    if (m.pitch > 0) rate = m.pitch;           // sing → the coil fires at your pitch
-    wasm.set_param(P.rate, Math.min(rate, 200));
+    if (m.onset) wasm.strike();
     $('#mic-bar').style.transform = `scaleX(${m.level.toFixed(3)})`;
   }
   const n = wasm.step(dt);
   const info = f32(wasm.info_ptr(), 16);
-  const act = Math.min(1.5, Math.log1p(info[6]) * 0.45);
-  const orbs = [[info[0], info[1], info[4]]];
-  if (info[5] > 1.5) orbs.push([info[2], info[3], info[4]]);
+  const act = Math.min(1.5, Math.log1p(info[2]) * 0.45);
+  if (ui.soundOn) {
+    const pan = info[3] / w * 2 - 1;
+    for (let i = 0; i < Math.min(2, info[0]); i++) sound.thunder(0.8 + Math.random() * 0.4, pan);
+    if (info[1] > 0) sound.crackle(0.6);
+  }
   const col = renderer.colorAt(ui.temp);
   renderer.render({
-    segs: f32(wasm.seg_ptr(), Math.max(1, n) * 8), segCount: n, orbs, orbColor: col, time: now / 1000,
-    activity: act, gain: ui.gain, thickness: ui.thickness, bloom: ui.bloom,
-    room: col.map((c) => c * act * 0.025), lightPos: [info[7] / w, 1 - info[8] / h],
+    segs: f32(wasm.seg_ptr(), Math.max(1, n) * 8), segCount: n, time: now / 1000, style: ui.style,
+    gain: ui.gain, thickness: ui.thickness, bloom: ui.bloom,
+    room: col.map((c) => c * act * (ui.style === 0 ? 0.03 : 0.012)), lightPos: [info[3] / w, 1 - info[4] / h],
   });
-  if (ui.soundOn) sound.update(act, rate, info[9]);
   requestAnimationFrame(frame);
 }
 
 async function boot() {
   try { renderer = new Renderer($('#view')); }
   catch (e) { document.body.insertAdjacentHTML('beforeend', `<p class="err">${e.message}</p>`); return; }
-  const { instance } = await WebAssembly.instantiateStreaming
-    ? await WebAssembly.instantiateStreaming(fetch('lightning.wasm'), {}).catch(async () => WebAssembly.instantiate(await (await fetch('lightning.wasm')).arrayBuffer(), {}))
-    : await WebAssembly.instantiate(await (await fetch('lightning.wasm')).arrayBuffer(), {});
-  wasm = instance.exports;
+  const bytes = await (await fetch('lightning.wasm')).arrayBuffer();
+  wasm = (await WebAssembly.instantiate(bytes, {})).instance.exports;
   wasm.init((Math.random() * 2 ** 31) >>> 0);
   renderer.setLUT(f32(wasm.lut_ptr(), wasm.lut_len() * 3).slice(), wasm.lut_len(), wasm.lut_tmin(), wasm.lut_tmax());
   buildPanel();
   setupInput();
-  setMode(0);
+  setStyle(0);
   poke();
-  window.__lm = { wasm, setMode, togglePanel };
+  window.__lm = { wasm, setStyle, togglePanel };
   requestAnimationFrame((t) => { last = t; frame(t); });
 }
 boot();
