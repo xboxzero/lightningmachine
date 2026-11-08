@@ -1,4 +1,5 @@
 import { Renderer } from './renderer.js';
+import { Renderer2D } from './renderer2d.js';
 import { Sound } from './audio.js';
 
 const $ = (s) => document.querySelector(s);
@@ -214,7 +215,19 @@ function frame(now) {
 
 async function boot() {
   try { renderer = new Renderer($('#view')); }
-  catch (e) { document.body.insertAdjacentHTML('beforeend', `<p class="err">${e.message}</p>`); return; }
+  catch (e) {
+    // WebGL2 missing or its shaders failed: switch to the Canvas 2D renderer on a fresh canvas
+    console.warn('WebGL2 renderer unavailable, using Canvas 2D:', e.message);
+    const old = $('#view'), cv = document.createElement('canvas');
+    cv.id = 'view'; old.replaceWith(cv);
+    try { renderer = new Renderer2D(cv); }
+    catch (e2) { document.body.insertAdjacentHTML('beforeend', `<p class="err">${e2.message}</p>`); return; }
+    const note = document.createElement('div');
+    note.className = 'note';
+    note.textContent = 'Compatibility mode (WebGL2 unavailable) — enable hardware acceleration in your browser for full quality.';
+    document.body.appendChild(note);
+    setTimeout(() => note.classList.add('hide'), 7000);
+  }
   const bytes = await (await fetch('lightning.wasm')).arrayBuffer();
   wasm = (await WebAssembly.instantiate(bytes, {})).instance.exports;
   wasm.init((Math.random() * 2 ** 31) >>> 0);

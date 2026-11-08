@@ -27,3 +27,5 @@ body.open #panel{transform:none;opacity:1;pointer-events:auto}
 #view{cursor:grab}#view:active{cursor:grabbing}
 details{border-top:1px solid rgba(160,180,255,.12);padding:6px 0}
 summary{cursor:pointer;color:#9fb8ff;font-weight:600;padding:2px 0}
+.note{position:fixed;left:50%;top:14px;transform:translateX(-50%);max-width:calc(100vw - 28px);padding:8px 14px;border-radius:10px;background:rgba(10,12,24,.8);border:1px solid rgba(160,180,255,.2);color:#c9d2f2;font-size:12px;transition:opacity .6s}
+.note.hide{opacity:0;pointer-events:none}

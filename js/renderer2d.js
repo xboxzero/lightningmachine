@@ -1,0 +1,131 @@
+// Canvas 2D fallback renderer — used when WebGL2 is unavailable (hardware acceleration off,
+// blocked GPU/driver, old browsers). Same simulation and colour science, simpler drawing:
+// projected channel segments with additive ("lighter") glow layers, chamber edges, and
+// Fresnel-weighted wall reflections clipped to each wall.
+import { windowCamera } from './renderer.js';
+
+const sample = (t, T) => {
+  const i = Math.round(Math.min(1, Math.max(0, (T - t.tmin) / (t.tmax - t.tmin))) * (t.n - 1));
+  return [t.data[i * 4], t.data[i * 4 + 1], t.data[i * 4 + 2], t.data[i * 4 + 3]];
+};
+const enc = (v) => Math.round(255 * Math.min(1, Math.max(0, v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055)));
+const BUCKETS = 48;
+
+export class Renderer2D {
+  constructor(canvas) {
+    this.canvas = canvas;
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true }) || canvas.getContext('2d');
+    if (!ctx) throw new Error('No 2D canvas available.');
+    this.ctx = ctx;
+    this.fallback = true;
+    this.scale = 1; this.w = this.h = 0;
+    this.paths = [];
+  }
+  setLUT(data, n, tmin, tmax) { this.lut = { data, n, tmin, tmax }; }
+  setBlackbody(data, n, tmin, tmax) { this.bb = { data, n, tmin, tmax }; }
+  resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5) * this.scale;
+    const w = Math.max(2, Math.floor(this.canvas.clientWidth * dpr));
+    const h = Math.max(2, Math.floor(this.canvas.clientHeight * dpr));
+    if (w !== this.w || h !== this.h) { this.w = w; this.h = h; this.canvas.width = w; this.canvas.height = h; }
+    return [w, h];
+  }
+  windowCamera(eye, half) { return windowCamera(eye, half, this.h); }
+
+  _proj(vp, x, y, z) {
+    const cw = vp[3] * x + vp[7] * y + vp[11] * z + vp[15];
+    if (cw < 5) return null;
+    const cx = vp[0] * x + vp[4] * y + vp[8] * z + vp[12];
+    const cy = vp[1] * x + vp[5] * y + vp[9] * z + vp[13];
+    return [(cx / cw * 0.5 + 0.5) * this.w, (0.5 - cy / cw * 0.5) * this.h, cw];
+  }
+
+  /** Builds per-colour-bucket paths of the (optionally mirrored) channel segments. */
+  _build(s, mx, my, mz, ox, oy, oz) {
+    const { vp } = s.cam;
+    const seg = s.segs, tmin = this.lut.tmin, tmax = this.lut.tmax;
+    const paths = Array.from({ length: BUCKETS }, () => ({ p: new Path2D(), n: 0, depth: 0 }));
+    for (let i = 0; i < s.segCount; i++) {
+      const o = i * 8;
+      const a = this._proj(vp, seg[o] * mx + ox, seg[o + 1] * my + oy, seg[o + 2] * mz + oz);
+      const b = this._proj(vp, seg[o + 3] * mx + ox, seg[o + 4] * my + oy, seg[o + 5] * mz + oz);
+      if (!a || !b) continue;
+      const k = Math.min(BUCKETS - 1, Math.max(0, Math.floor((seg[o + 6] - tmin) / (tmax - tmin) * BUCKETS)));
+      const P = paths[k];
+      P.p.moveTo(a[0], a[1]); P.p.lineTo(b[0], b[1]);
+      P.n++; P.depth += b[2];
+    }
+    return paths;
+  }
+
+  _strokeAll(paths, s, alphaScale) {
+    const ctx = this.ctx, { pxPerM } = s.cam, tmin = this.lut.tmin, tmax = this.lut.tmax;
+    for (let k = 0; k < BUCKETS; k++) {
+      const P = paths[k];
+      if (!P.n) continue;
+      const T = tmin + (k + 0.5) / BUCKETS * (tmax - tmin);
+      const [r, g, b, B] = sample(this.lut, T);
+      if (B < 0.01) continue;
+      const mpx = pxPerM / (P.depth / P.n);          // pixels per metre at this bucket's depth
+      const rgb = `${enc(r)},${enc(g)},${enc(b)}`;
+      // soft scatter, corona, white-hot core
+      for (const [wm, minPx, a] of [[90, 10, 0.035], [28, 3.5, 0.12], [5, 1.3, 0.85]]) {
+        ctx.lineWidth = Math.max(minPx, wm * s.thickness * mpx);
+        ctx.strokeStyle = `rgba(${rgb},${Math.min(1, a * B * s.gain * alphaScale)})`;
+        ctx.stroke(P.p);
+      }
+    }
+  }
+
+  render(s) {
+    const ctx = this.ctx, { w, h } = this, { vp } = s.cam, H = s.half;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#030306';
+    ctx.fillRect(0, 0, w, h);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    // light scattered in the chamber, centred on the discharge
+    const lp = this._proj(vp, s.light[0], s.light[1], s.light[2]);
+    if (lp && s.light[3] > 0.01) {
+      const c = s.lightColor, rad = Math.max(w, h) * 0.6;
+      const g = ctx.createRadialGradient(lp[0], lp[1], 0, lp[0], lp[1], rad);
+      const a = Math.min(0.25, s.light[3] * 0.08);
+      g.addColorStop(0, `rgba(${enc(c[0])},${enc(c[1])},${enc(c[2])},${a})`);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+    }
+    // chamber edges
+    const corners = [];
+    for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) corners.push(this._proj(vp, x * H[0], y * H[1], z * H[2]));
+    ctx.strokeStyle = 'rgba(140,155,200,0.22)'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (const [i, j] of [[0, 4], [1, 5], [2, 6], [3, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 1], [2, 3], [4, 5], [6, 7]]) {
+      const a = corners[i], b = corners[j];
+      if (a && b) { ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); }
+    }
+    ctx.stroke();
+    if (!s.segCount) return;
+    ctx.globalCompositeOperation = 'lighter';
+    // reflections in the glass walls (method of images), clipped to the projected wall quad;
+    // average Fresnel reflectance of glass at oblique viewing ≈ 0.06
+    if (s.reflect > 0.05) {
+      const walls = [
+        [[-1, 1, 1, 2 * H[0], 0, 0], [[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]]],
+        [[-1, 1, 1, -2 * H[0], 0, 0], [[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]]],
+        [[1, -1, 1, 0, 2 * H[1], 0], [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]]],
+        [[1, -1, 1, 0, -2 * H[1], 0], [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1]]],
+        [[1, 1, -1, 0, 0, -2 * H[2]], [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1]]],
+      ];
+      for (const [m, quad] of walls) {
+        const q = quad.map(([x, y, z]) => this._proj(vp, x * H[0], y * H[1], z * H[2]));
+        if (q.some((v) => !v)) continue;
+        ctx.save();
+        ctx.beginPath(); ctx.moveTo(q[0][0], q[0][1]); for (let i = 1; i < 4; i++) ctx.lineTo(q[i][0], q[i][1]); ctx.closePath();
+        ctx.clip();
+        this._strokeAll(this._build(s, m[0], m[1], m[2], m[3], m[4], m[5]), s, 0.06 * s.reflect);
+        ctx.restore();
+      }
+    }
+    this._strokeAll(this._build(s, 1, 1, 1, 0, 0, 0), s, 1);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}

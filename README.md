@@ -24,6 +24,9 @@ The buttons in the bottom-right corner hide after 2.5 s of no activity; move the
 - **Panel sections:** Lightning · Quantum tunnelling · Chamber flow · Glass & view. Raise *Glass reflection* above 1 for a kaleidoscope-like effect.
 - **Keys:** Space strike · H panel · F fullscreen · S sound · M mic
 
+## Compatibility
+WebGL2 is used when available. Context creation retries with plainer options if the browser rejects the low-latency ones. Without WebGL2 (hardware acceleration off, blocked GPU, old browser) the page switches automatically to a Canvas 2D renderer: same simulation and colours, with simpler glow.
+
 ## Build
 ```bash
 ./build.sh   # Rust → lightning.wasm

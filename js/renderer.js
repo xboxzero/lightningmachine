@@ -229,10 +229,42 @@ function mirror(axis, d) {
   return m;
 }
 
+/**
+ * Off-axis projection with the front glass (z = half.z, |x| ≤ hx, |y| ≤ hy) as the screen
+ * (Kooima's generalised perspective). view = translate(−eye), proj = frustum(l, r, b, t).
+ * Returns the view-projection matrix and pixels-per-metre at depth w = 1.
+ */
+export function windowCamera(eye, half, heightPx) {
+  const n = 5, f = 60000;
+  const dist = eye[2] - half[2];
+  const k = n / dist;
+  const l = (-half[0] - eye[0]) * k, r = (half[0] - eye[0]) * k;
+  const b = (-half[1] - eye[1]) * k, t = (half[1] - eye[1]) * k;
+  const P = new Float32Array(16);
+  P[0] = 2 * n / (r - l); P[5] = 2 * n / (t - b);
+  P[8] = (r + l) / (r - l); P[9] = (t + b) / (t - b); P[10] = -(f + n) / (f - n); P[11] = -1;
+  P[14] = -2 * f * n / (f - n);
+  const vp = new Float32Array(P);
+  for (let r2 = 0; r2 < 4; r2++) vp[12 + r2] = P[r2] * -eye[0] + P[4 + r2] * -eye[1] + P[8 + r2] * -eye[2] + P[12 + r2];
+  return { vp, pxPerM: heightPx / (half[1] * 2) * dist };
+}
+
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
-    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, desynchronized: true, powerPreference: 'high-performance' });
+    // Some browsers/drivers reject particular context options (desynchronized, power
+    // preference) — try progressively plainer requests before giving up.
+    const attempts = [
+      { antialias: false, alpha: false, desynchronized: true, powerPreference: 'high-performance' },
+      { antialias: false, alpha: false, powerPreference: 'high-performance' },
+      { antialias: false, alpha: false },
+      {},
+    ];
+    let gl = null;
+    for (const opt of attempts) {
+      try { gl = canvas.getContext('webgl2', opt); } catch (e) { gl = null; }
+      if (gl) break;
+    }
     if (!gl) throw new Error('WebGL2 is not available in this browser.');
     this.gl = gl;
     const floatOK = !!gl.getExtension('EXT_color_buffer_float');
@@ -312,23 +344,7 @@ export class Renderer {
    * Off-axis projection with the front glass (z = half.z, |x| ≤ hx, |y| ≤ hy) as the screen.
    * view = translate(−eye) (the screen is axis-aligned), proj = frustum(l, r, b, t).
    */
-  windowCamera(eye, half) {
-    const n = 5, f = 60000;
-    const dist = eye[2] - half[2];
-    const k = n / dist;
-    const l = (-half[0] - eye[0]) * k, r = (half[0] - eye[0]) * k;
-    const b = (-half[1] - eye[1]) * k, t = (half[1] - eye[1]) * k;
-    const P = new Float32Array(16);
-    P[0] = 2 * n / (r - l); P[5] = 2 * n / (t - b);
-    P[8] = (r + l) / (r - l); P[9] = (t + b) / (t - b); P[10] = -(f + n) / (f - n); P[11] = -1;
-    P[14] = -2 * f * n / (f - n);
-    const vp = new Float32Array(P);
-    // vp = P · translate(−eye)
-    for (let r2 = 0; r2 < 4; r2++) vp[12 + r2] = P[r2] * -eye[0] + P[4 + r2] * -eye[1] + P[8 + r2] * -eye[2] + P[12 + r2];
-    // pixels per metre at depth w = 1 (width scaling in the vertex shader)
-    const pxPerM = this.h / (half[1] * 2) * dist;
-    return { vp, pxPerM };
-  }
+  windowCamera(eye, half) { return windowCamera(eye, half, this.h); }
 
   render(s) {
     const gl = this.gl, { w, h } = this, hdr = this.targets[0];
