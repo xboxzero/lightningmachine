@@ -21,3 +21,7 @@ body.open #panel{transform:none;opacity:1;pointer-events:auto}
 .hint{color:#8a94b8;font-size:11px;margin:8px 0 0}
 .err{position:fixed;inset:auto 0 45% 0;text-align:center;color:#ff8787}
 @media (max-width:520px){#panel{left:12px;right:12px;width:auto;max-height:60vh}}
+.tb{display:grid;grid-template-columns:auto 1fr auto;font-size:10px;color:#8a94b8;gap:2px 4px;margin:6px 0 2px}
+.tb canvas{grid-column:1/4;width:100%;height:10px;border-radius:3px}
+.tb span:nth-of-type(2){text-align:center}
+#view{cursor:grab}#view:active{cursor:grabbing}
