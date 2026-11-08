@@ -1,294 +1,533 @@
 import { Renderer } from './renderer.js';
 import { Renderer2D } from './renderer2d.js';
-import { Sound } from './audio.js';
+import { AudioEngine } from './audio.js';
+import { v3 } from './math.js';
 
 const $ = (s) => document.querySelector(s);
+const PHASES = ['Idle — charge building', 'Stepped leader', 'Return stroke', 'Inter-stroke', 'Dart leader', 'Afterglow / continuing current'];
+const THUNDER_SR = 24000;
+const CLOUD_BASE = 2900, CLOUD_TOP = 3900;
+const RES = { low: [40, 72, 40], medium: [48, 88, 48], high: [64, 112, 64] };
+
 // parameter ids — must match core/src/lib.rs
-const P = { bolts: 0, blobs: 1, heat: 2, flow: 3, eta: 4, quantum: 5, betaLog: 6, workFn: 7, branch: 8, connect: 9,
-  ipeak: 10, icc: 11, restrike: 12, slowmo: 13, life: 14, crackle: 15, tension: 16, mic: 17, leader: 18,
-  turb: 19, eddy: 20, diffuse: 21, kicks: 22, hfield: 23, qswirl: 24, measure: 25 };
+const P = { eta: 0, quantum: 1, betaLog: 2, workFn: 3, noise: 4, ipeak: 5, leaderSlow: 6, strokeSlow: 7, activity: 8, v0: 9,
+  tower: 10, micLevel: 11, micPitch: 12, micSteer: 13, sweeps: 14, auto: 15, afterglow: 16, strokes: 17, wind: 18, gust: 19 };
 
-let wasm, renderer;
-const sound = new Sound();
-const ui = { gain: 1, thickness: 1, bloom: 1.0, vol: 0.7, reflect: 0, mist: 0.3, autoQuality: true, sway: 1, soundOn: false, micOn: false };
-const HY = 1000, HZ = 900, FOV = 50 * Math.PI / 180;
-const view = { dragX: 0, dragY: 0 };
+const state = {
+  paused: false, time: 0, exposure: 0.9, bloom: 0.9, bloomRadius: 1.0, coreWidth: 5, boltGain: 1.0, rain: 0.7, ambient: 1.0,
+  flashK: 0.8, volume: 0.8, quality: 1, res: 'medium', camMode: 'orbit', fov: 55 * Math.PI / 180,
+  mic: false, micLevel: 0, micPitch: 0.5, thunderETA: [], lastStroke: -1, lastFlash: -1, strikeDist: 0,
+};
 
-const f32 = (p, n) => new Float32Array(wasm.memory.buffer, p, n);
+const cam = {
+  target: [0, 1300, 0], yaw: 0.35, pitch: 0.05, dist: 4300,
+  pos: [0, 120, 5200], fyaw: Math.PI, fpitch: 0.2, // fly
+  vel: [0, 0, 0], eye: [0, 0, 0], look: [0, 0, 0],
+};
 
-const controls = [
-  { sec: 'Qubit chaos', id: 'kicks', label: 'Floquet kicks / s', min: 0, max: 12, step: 0.1, v: 2.5, p: P.kicks },
-  { sec: 'Qubit chaos', id: 'hfield', label: 'Transverse field h (0 = regular, 0.9 = chaotic)', min: 0, max: 1.6, step: 0.005, v: 0.9045, p: P.hfield },
-  { sec: 'Qubit chaos', id: 'measure', label: 'Measurement rate (per qubit per kick)', min: 0, max: 1, step: 0.01, v: 0.2, p: P.measure },
-  { sec: 'Qubit chaos', id: 'qswirl', label: 'Qubit swirl strength', min: 0, max: 3, step: 0.05, v: 1, p: P.qswirl },
-  { sec: 'Lightning', id: 'bolts', label: 'Bolts', min: 1, max: 10, step: 1, v: 4, p: P.bolts },
-  { sec: 'Lightning', id: 'connect', label: 'Connect distance (m)', min: 0, max: 400, step: 5, v: 170, p: P.connect },
-  { sec: 'Lightning', id: 'branch', label: 'Branching', min: 0, max: 2, step: 0.01, v: 0.35, p: P.branch },
-  { sec: 'Lightning', id: 'eta', label: 'Breakdown exponent η', min: 0.5, max: 8, step: 0.1, v: 2.6, p: P.eta },
-  { sec: 'Lightning', id: 'leader', label: 'Leader speed (steps/s)', min: 30, max: 800, step: 5, v: 170, p: P.leader },
-  { sec: 'Lightning', id: 'ipeak', label: 'Peak current (kA)', min: 5, max: 200, step: 1, v: 31, p: P.ipeak },
-  { sec: 'Lightning', id: 'icc', label: 'Continuing current (A)', min: 0, max: 8000, step: 10, v: 2500, p: P.icc },
-  { sec: 'Lightning', id: 'restrike', label: 'Re-strikes / s', min: 0, max: 5, step: 0.05, v: 1, p: P.restrike },
-  { sec: 'Lightning', id: 'slowmo', label: 'Stroke slow-motion ×', min: 200, max: 20000, step: 100, v: 2000, p: P.slowmo, map: (x) => 1 / x },
-  { sec: 'Lightning', id: 'life', label: 'Bolt lifetime (s)', min: 2, max: 30, step: 0.5, v: 11, p: P.life },
-  { sec: 'Quantum tunnelling', id: 'quantum', label: 'WKB tunnelling weight', min: 0, max: 1, step: 0.01, v: 0.25, p: P.quantum },
-  { sec: 'Quantum tunnelling', id: 'betaLog', label: 'Field enhancement log₁₀β', min: 3, max: 5.5, step: 0.05, v: 4.4, p: P.betaLog },
-  { sec: 'Quantum tunnelling', id: 'workFn', label: 'Work function φ (eV)', min: 2, max: 7, step: 0.05, v: 4.5, p: P.workFn },
-  { sec: 'Smoke & mist motion', id: 'turb', label: 'Turbulence (rms m/s)', min: 0, max: 250, step: 1, v: 30, p: P.turb },
-  { sec: 'Smoke & mist motion', id: 'eddy', label: 'Largest eddy (m)', min: 300, max: 4000, step: 50, v: 1400, p: P.eddy },
-  { sec: 'Smoke & mist motion', id: 'diffuse', label: 'Mist diffusion (m²/s)', min: 0, max: 400, step: 5, v: 40, p: P.diffuse },
-  { sec: 'Smoke & mist motion', id: 'mist', label: 'Mist haze (cooling glow spread)', min: 0, max: 2, step: 0.05, v: 0.3, ui: 'mist' },
-  { sec: 'Chamber flow', id: 'flow', label: 'Convection rolls', min: 0, max: 3, step: 0.05, v: 0.15, p: P.flow },
-  { sec: 'Chamber flow', id: 'tension', label: 'Smoothness', min: 0, max: 1, step: 0.01, v: 0.3, p: P.tension },
-  { sec: 'Chamber flow', id: 'crackle', label: 'Crackle', min: 0, max: 1.5, step: 0.01, v: 0.3, p: P.crackle },
-  { sec: 'Glass & view', id: 'reflect', label: 'Glass reflection (1 = real glass)', min: 0, max: 12, step: 0.1, v: 0, ui: 'reflect' },
-  { sec: 'Glass & view', id: 'sway', label: 'Automatic viewpoint drift', min: 0, max: 3, step: 0.05, v: 1, ui: 'sway' },
-  { sec: 'Glass & view', id: 'gain', label: 'Brightness', min: 0.1, max: 3, step: 0.01, v: 1, ui: 'gain' },
-  { sec: 'Glass & view', id: 'thickness', label: 'Thickness', min: 0.3, max: 4, step: 0.05, v: 1, ui: 'thickness' },
-  { sec: 'Glass & view', id: 'bloom', label: 'Bloom', min: 0, max: 3, step: 0.05, v: 1, ui: 'bloom' },
-  { sec: 'Glass & view', id: 'vol', label: 'Volume', min: 0, max: 1.5, step: 0.01, v: 0.7, ui: 'vol', fn: (x) => sound.setVolume(x) },
+let wasm, mem, renderer, audio;
+
+function f32(ptr, n) { return new Float32Array(wasm.memory.buffer, ptr, n); }
+
+let thunderWorker = null;
+async function loadWasm() {
+  const res = await fetch('lightning.wasm');
+  const bytes = await res.arrayBuffer();
+  const module = await WebAssembly.compile(bytes);
+  const instance = await WebAssembly.instantiate(module, {});
+  wasm = instance.exports;
+  try {
+    thunderWorker = new Worker('js/thunder-worker.js');
+    thunderWorker.postMessage({ type: 'init', module, seed: (Math.random() * 2 ** 31) | 0 });
+    thunderWorker.onmessage = (e) => {
+      const m = e.data;
+      state.thunderMsgs = (state.thunderMsgs || 0) + 1;
+      if (m.type === 'pcm' && audio && audio.ctx) audio.playThunderStems(m.data, m.frames, m.sr, m.t0, m.offset || 0);
+    };
+  } catch (e) { console.warn('worker unavailable, synthesising on main thread', e); thunderWorker = null; }
+}
+
+function requestThunder() {
+  if (!audio || !audio.ctx) return;
+  const ch = 12; // world-fixed directional stems → HRTF
+  const fwd = v3.sub(cam.look, cam.eye);
+  const listener = [cam.eye[0], cam.eye[1], cam.eye[2], fwd[0], fwd[2]];
+  const t0 = audio.ctx.currentTime;
+  if (thunderWorker) {
+    const count = wasm.thunder_snapshot();
+    const snap = f32(wasm.snap_ptr(), count * 8).slice();
+    thunderWorker.postMessage({ type: 'gen', count, snap, i0: wasm.thunder_i0(), listener, ch, sr: THUNDER_SR, t0 }, [snap.buffer]);
+  } else {
+    wasm.thunder_snapshot();
+    const frames = wasm.thunder_gen(ch, THUNDER_SR);
+    audio.playThunderStems(f32(wasm.thunder_ptr(), frames * ch), frames, THUNDER_SR, t0, wasm.thunder_offset());
+  }
+}
+
+function initSim() {
+  const [nx, ny, nz] = RES[state.res];
+  wasm.init(nx, ny, nz, (Math.random() * 2 ** 31) >>> 0);
+  renderer.setLUT(f32(wasm.lut_ptr(), wasm.lut_len() * 3).slice(), wasm.lut_len(), wasm.lut_tmin(), wasm.lut_tmax());
+  drawLUTBar();
+}
+
+// ------------------------------------------------------------------ UI
+const sliders = [
+  { sec: 'Wind (channel drift)', id: 'wind', label: 'Mean wind at 1 km', unit: 'm/s', min: 0, max: 80, step: 1, v: 25, p: P.wind },
+  { sec: 'Wind (channel drift)', id: 'gust', label: 'Turbulent gusts (rms)', unit: 'm/s', min: 0, max: 60, step: 1, v: 18, p: P.gust },
+  { sec: 'Storm', id: 'activity', label: 'Storm activity', unit: 'flashes/min', min: 1, max: 40, step: 0.5, v: 8, p: P.activity },
+  { sec: 'Storm', id: 'strokes', label: 'Mean strokes / flash', min: 1, max: 8, step: 0.1, v: 3.5, p: P.strokes },
+  { sec: 'Storm', id: 'v0', label: 'Cloud potential', unit: 'MV', min: 10, max: 150, step: 1, v: 50, p: P.v0 },
+  { sec: 'Storm', id: 'ipeak', label: 'Median peak current', unit: 'kA', min: 5, max: 120, step: 1, v: 31, p: P.ipeak },
+  { sec: 'Physics (DBM / Gaussian)', id: 'eta', label: 'Breakdown exponent η', min: 0.5, max: 7, step: 0.05, v: 3.0, p: P.eta },
+  { sec: 'Physics (DBM / Gaussian)', id: 'noise', label: 'Gaussian space-charge σ', min: 0, max: 2, step: 0.01, v: 0.55, p: P.noise },
+  { sec: 'Physics (DBM / Gaussian)', id: 'sweeps', label: 'SOR sweeps / step', min: 1, max: 24, step: 1, v: 6, p: P.sweeps },
+  { sec: 'Quantum tunnelling', id: 'quantum', label: 'WKB tunnelling weight', min: 0, max: 0.5, step: 0.005, v: 0.08, p: P.quantum },
+  { sec: 'Quantum tunnelling', id: 'betaLog', label: 'Field enhancement log₁₀β', min: 2.5, max: 5.5, step: 0.05, v: 4.3, p: P.betaLog },
+  { sec: 'Quantum tunnelling', id: 'workFn', label: 'Work function φ', unit: 'eV', min: 2, max: 7, step: 0.05, v: 4.5, p: P.workFn },
+  { sec: 'Time', id: 'leaderSlow', label: 'Leader slow-motion', min: Math.log10(0.0005), max: Math.log10(0.05), step: 0.01, v: Math.log10(0.004), p: P.leaderSlow, log: true, fmt: (x) => '×' + Math.round(1 / x) },
+  { sec: 'Time', id: 'strokeSlow', label: 'Stroke slow-motion', min: Math.log10(0.02), max: 0, step: 0.01, v: Math.log10(0.25), p: P.strokeSlow, log: true, fmt: (x) => '×' + (1 / x).toFixed(1) },
+  { sec: 'Time', id: 'afterglow', label: 'Channel cooling τ', unit: 'ms', min: 2, max: 120, step: 1, v: 25, p: P.afterglow },
+  { sec: 'Visual', id: 'exposure', label: 'Exposure', min: 0.1, max: 4, step: 0.01, v: 0.9, s: 'exposure' },
+  { sec: 'Visual', id: 'bloom', label: 'Bloom (Gaussian scatter)', min: 0, max: 3, step: 0.01, v: 0.9, s: 'bloom' },
+  { sec: 'Visual', id: 'coreWidth', label: 'Channel width', unit: 'm', min: 1, max: 30, step: 0.5, v: 5, s: 'coreWidth' },
+  { sec: 'Visual', id: 'rain', label: 'Rain', min: 0, max: 1, step: 0.01, v: 0.7, s: 'rain' },
+  { sec: 'Visual', id: 'quality', label: 'Render scale', min: 0.35, max: 1, step: 0.05, v: 1, s: 'quality' },
+  { sec: 'Audio', id: 'volume', label: 'Master volume', min: 0, max: 1.5, step: 0.01, v: 0.8, s: 'volume' },
+  { sec: 'Microphone', id: 'micSteer', label: 'Mic steering strength', min: 0, max: 3, step: 0.05, v: 1, p: P.micSteer },
 ];
 
 function buildPanel() {
-  const body = $('#controls');
+  const panel = $('#panel-body');
   const secs = {};
-  for (const c of controls) {
-    if (!secs[c.sec]) {
+  for (const sd of sliders) {
+    if (!secs[sd.sec]) {
       const d = document.createElement('details');
-      d.open = c.sec === 'Qubit chaos';
-      d.innerHTML = `<summary>${c.sec}</summary>`;
-      body.appendChild(d);
-      secs[c.sec] = d;
+      d.open = ['Storm', 'Physics (DBM / Gaussian)', 'Quantum tunnelling'].includes(sd.sec);
+      d.innerHTML = `<summary>${sd.sec}</summary><div class="sec"></div>`;
+      panel.appendChild(d);
+      secs[sd.sec] = d.querySelector('.sec');
     }
     const row = document.createElement('label');
     row.className = 'row';
-    row.innerHTML = `<span>${c.label}</span><b></b><input type="range" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.v}">`;
-    secs[c.sec].appendChild(row);
-    const inp = row.querySelector('input'), out = row.querySelector('b');
+    row.innerHTML = `<span class="lbl">${sd.label}</span><span class="val" id="v-${sd.id}"></span>
+      <input type="range" id="s-${sd.id}" min="${sd.min}" max="${sd.max}" step="${sd.step}" value="${sd.v}">`;
+    secs[sd.sec].appendChild(row);
+    const input = row.querySelector('input'), val = row.querySelector('.val');
     const apply = () => {
-      const x = parseFloat(inp.value);
-      out.textContent = c.step >= 1 ? x.toFixed(0) : x.toFixed(2);
-      if (c.p !== undefined) wasm.set_param(c.p, c.map ? c.map(x) : x);
-      if (c.ui) ui[c.ui] = x;
-      if (c.fn) c.fn(x);
+      let x = parseFloat(input.value);
+      if (sd.log) x = Math.pow(10, x);
+      val.textContent = sd.fmt ? sd.fmt(x) : (Math.abs(x) >= 100 ? x.toFixed(0) : x.toFixed(sd.step < 0.05 ? 2 : 1)) + (sd.unit ? ' ' + sd.unit : '');
+      if (sd.p !== undefined) wasm.set_param(sd.p, x);
+      if (sd.s) {
+        state[sd.s] = x;
+        if (sd.s === 'volume' && audio) audio.setVolume(x);
+        if (sd.s === 'rain' && audio) audio.setRain(x);
+        if (sd.s === 'quality') renderer.scale = x;
+      }
     };
-    inp.addEventListener('input', apply);
+    sd.apply = apply;
+    input.addEventListener('input', apply);
     apply();
   }
-  const qs = secs['Qubit chaos'];
-  const ro = document.createElement('div');
-  ro.className = 'qread';
-  ro.innerHTML = '<canvas id="qcv" width="276" height="62"></canvas><div id="qtxt"></div>';
-  qs.insertBefore(ro, qs.children[1]);
-  drawBars();
+  // selects / toggles appended to sections
+  const extra = (sec, html) => { const d = document.createElement('div'); d.className = 'row'; d.innerHTML = html; secs[sec].appendChild(d); return d; };
+  extra('Storm', `<span class="lbl">Grid resolution</span><select id="sel-res"><option value="low">Low 40×72×40</option><option value="medium" selected>Medium 48×88×48</option><option value="high">High 64×112×64</option></select>`);
+  extra('Storm', `<label class="chk"><input type="checkbox" id="chk-auto" checked> Automatic strikes</label><label class="chk"><input type="checkbox" id="chk-tower" checked> Grounded tower</label>`);
+  extra('Audio', `<span class="lbl">Speaker layout</span><select id="sel-layout"><option value="auto">Auto-detect</option><option value="stereo">Stereo / headphones (ITD)</option><option value="5.1">5.1 surround (VBAP)</option></select>`);
+  extra('Audio', `<span class="lbl" id="audio-info">Audio not started</span>`);
+  extra('Microphone', `<span class="lbl">Loudness → leader speed & strike trigger · pitch (spectral centroid) → branching & steering direction</span>`);
+  $('#sel-res').onchange = (e) => { state.res = e.target.value; initSim(); };
+  $('#chk-auto').onchange = (e) => wasm.set_param(P.auto, e.target.checked ? 1 : 0);
+  $('#chk-tower').onchange = (e) => wasm.set_param(P.tower, e.target.checked ? 1 : 0);
+  $('#sel-layout').onchange = (e) => { audio.applyLayout(e.target.value); updateAudioInfo(); };
 }
 
-/** Live read-out: six Bloch vectors (projected) + Rényi-2 entanglement entropy. */
-function drawQubits() {
-  const cv = document.getElementById('qcv');
-  if (!cv || !document.body.classList.contains('open')) return;
-  const q = f32(wasm.qubits_ptr(), 20), g = cv.getContext('2d');
-  g.clearRect(0, 0, cv.width, cv.height);
-  for (let k = 0; k < 6; k++) {
-    const cx = 23 + k * 46, cy = 31, R = 20;
-    const x = q[2 + 3 * k], y = q[3 + 3 * k], z = q[4 + 3 * k];
-    g.strokeStyle = 'rgba(160,180,255,.35)'; g.lineWidth = 1;
-    g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.stroke();
-    g.beginPath(); g.ellipse(cx, cy, R, R * 0.3, 0, 0, Math.PI * 2); g.stroke();
-    // oblique projection of the Bloch vector
-    const px = cx + R * (x * 0.9 + y * 0.35), py = cy - R * (z * 0.9 - y * 0.25);
-    const m = Math.hypot(x, y, z);
-    g.strokeStyle = `hsl(${200 + 120 * (1 - m)},90%,${45 + 30 * m}%)`; g.lineWidth = 2;
-    g.beginPath(); g.moveTo(cx, cy); g.lineTo(px, py); g.stroke();
-    g.fillStyle = g.strokeStyle; g.beginPath(); g.arc(px, py, 2.5, 0, Math.PI * 2); g.fill();
-  }
-  document.getElementById('qtxt').textContent = `entanglement S₂ = ${q[0].toFixed(2)} bits (max 3) · kicks ${q[1] | 0}`;
+function updateAudioInfo() {
+  const el = $('#audio-info');
+  if (!el) return;
+  if (!audio.ctx) { el.textContent = 'Audio not started'; return; }
+  const d = audio.ctx.destination;
+  el.textContent = `Thunder: 3-D HRTF (headphones best) · output ${audio.channels === 6 ? '5.1' : 'stereo'} · device max ${d.maxChannelCount} ch · ${audio.ctx.sampleRate} Hz · latency ${((audio.ctx.baseLatency || 0) * 1000).toFixed(1)} ms`;
 }
 
-function drawBars() {
-  const enc = (v) => Math.round(255 * Math.min(1, v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055));
-  for (const [id, table, scale] of [['#tbar', renderer.lut, 1.2]]) {
-    const cv = $(id), g = cv.getContext('2d');
-    cv.width = 256; cv.height = 10;
-    for (let x = 0; x < 256; x++) {
-      const T = table.tmin + (table.tmax - table.tmin) * x / 255;
-      const [r, gg, b, B] = Renderer.sample(table, T);
-      const k = Math.min(1, B * scale);
-      g.fillStyle = `rgb(${enc(r * k)},${enc(gg * k)},${enc(b * k)})`;
-      g.fillRect(x, 0, 1, 10);
-    }
+function drawLUTBar() {
+  const cv = $('#lut-bar'), g = cv.getContext('2d');
+  const n = wasm.lut_len(), lut = f32(wasm.lut_ptr(), n * 3);
+  const W = cv.width = 256, H = cv.height = 10;
+  for (let x = 0; x < W; x++) {
+    const i = Math.floor(x / (W - 1) * (n - 1));
+    const enc = (c) => Math.round(255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055));
+    g.fillStyle = `rgb(${enc(lut[i * 3])},${enc(lut[i * 3 + 1])},${enc(lut[i * 3 + 2])})`;
+    g.fillRect(x, 0, 1, H);
   }
 }
 
-// ---------------------------------------------------------------- UI behaviour
-let idleT = 0;
-function poke() {
-  document.body.classList.remove('idle');
-  clearTimeout(idleT);
-  idleT = setTimeout(() => { if (!document.body.classList.contains('open')) document.body.classList.add('idle'); }, 2500);
-}
-function togglePanel(force) {
-  const open = force !== undefined ? force : !document.body.classList.contains('open');
-  document.body.classList.toggle('open', open);
-  poke();
-}
-function toggleFullscreen() {
-  const d = document, el = d.documentElement;
-  if (!(d.fullscreenElement || d.webkitFullscreenElement)) (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el)?.catch?.(() => {});
-  else (d.exitFullscreen || d.webkitExitFullscreen).call(d);
-}
-async function toggleSound() {
-  if (!ui.soundOn) { await sound.start(); sound.setVolume(ui.vol); }
-  ui.soundOn = !ui.soundOn;
-  $('#btn-sound').classList.toggle('on', ui.soundOn);
-  $('#btn-sound').textContent = ui.soundOn ? '🔊' : '🔈';
-}
-async function toggleMic() {
-  if (ui.micOn) { sound.disableMic(); ui.micOn = false; wasm.set_param(P.mic, 0); $('#mic-bar').style.transform = 'scaleX(0)'; }
-  else {
-    try { await sound.enableMic(); ui.micOn = true; if (!ui.soundOn) await toggleSound(); }
-    catch (e) { alert('Microphone unavailable: ' + e.message); }
-  }
-  $('#btn-mic').classList.toggle('on', ui.micOn);
-}
-
+// ------------------------------------------------------------------ input: mouse / touch / keyboard / gamepad / virtual pads
+const keys = new Set();
+const input = { orbitX: 0, orbitY: 0, moveX: 0, moveY: 0, zoom: 0, up: 0 };
 function setupInput() {
   const cv = renderer.canvas;
-  let down = null;
+  let drag = null;
+  const pointers = new Map();
+  cv.addEventListener('contextmenu', (e) => e.preventDefault());
   cv.addEventListener('pointerdown', (e) => {
     cv.setPointerCapture(e.pointerId);
-    down = { x: e.clientX, y: e.clientY, t: performance.now(), moved: 0, id: e.pointerId };
-    poke();
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    drag = { b: e.button, shift: e.shiftKey };
   });
   cv.addEventListener('pointermove', (e) => {
-    poke();
-    if (!down || e.pointerId !== down.id) return;
-    const dx = e.clientX - down.x, dy = e.clientY - down.y;
-    down.x = e.clientX; down.y = e.clientY;
-    down.moved += Math.abs(dx) + Math.abs(dy);
-    // dragging moves your eye in front of the glass → look around inside the chamber
-    view.dragX = Math.max(-1.6, Math.min(1.6, view.dragX - dx / cv.clientWidth * 3));
-    view.dragY = Math.max(-1.2, Math.min(1.2, view.dragY + dy / cv.clientHeight * 3));
-  });
-  const up = (e) => {
-    if (down && e.pointerId === down.id) {
-      if (down.moved < 8 && performance.now() - down.t < 350) wasm.strike();
-      down = null;
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (drag.pinch) zoomBy((drag.pinch - d) * 0.006);
+      drag.pinch = d;
+      return;
     }
-  };
+    if (drag && (drag.b === 2 || drag.shift)) pan(dx, dy);
+    else rotate(dx, dy);
+  });
+  const up = (e) => { pointers.delete(e.pointerId); if (pointers.size < 2 && drag) drag.pinch = 0; };
   cv.addEventListener('pointerup', up);
   cv.addEventListener('pointercancel', up);
-  window.addEventListener('mousemove', poke);
+  cv.addEventListener('wheel', (e) => { e.preventDefault(); zoomBy(e.deltaY * 0.0012); }, { passive: false });
   window.addEventListener('keydown', (e) => {
-    if (e.target.tagName === 'INPUT') return;
-    poke();
-    if (e.code === 'Space') { e.preventDefault(); wasm.strike(); }
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    keys.add(e.code);
+    if (e.code === 'Space') { e.preventDefault(); strike(); }
     if (e.code === 'KeyF') toggleFullscreen();
-    if (e.code === 'KeyH' || e.code === 'Escape') togglePanel(e.code === 'Escape' ? false : undefined);
-    if (e.code === 'KeyS') toggleSound();
+    if (e.code === 'KeyC') cycleCamera();
     if (e.code === 'KeyM') toggleMic();
+    if (e.code === 'KeyP') togglePause();
+    if (e.code === 'KeyH') togglePanel();
+    if (e.code === 'KeyR') resetCamera();
   });
-  $('#btn-menu').onclick = () => togglePanel();
-  $('#btn-close').onclick = () => togglePanel(false);
-  $('#btn-fs').onclick = toggleFullscreen;
-  $('#btn-sound').onclick = toggleSound;
-  $('#btn-mic').onclick = toggleMic;
-  $('#btn-strike').onclick = () => wasm.strike();
+  window.addEventListener('keyup', (e) => keys.delete(e.code));
+  setupVirtualPads();
 }
 
-// ---------------------------------------------------------------- frame loop
-const blobPos = new Float32Array(48), blobCol = new Float32Array(48);
-let last = performance.now();
-// adaptive quality: keep ~60 fps by scaling the render resolution (and dropping wall
-// reflections as a last resort on very slow devices)
-const perf = { avg: 16.7, t: 0, reflections: true };
-function adapt(ms) {
-  ms = Math.min(ms, 250);
-  perf.avg = perf.avg * 0.85 + ms * 0.15;
-  perf.t += ms;
-  if (!ui.autoQuality || perf.t < 500) return;   // re-evaluate every half second
-  perf.t = 0;
-  const minScale = renderer.fallback ? 0.4 : 0.35;
-  if (perf.avg > 20 && renderer.scale > minScale) renderer.scale = Math.max(minScale, renderer.scale * (perf.avg > 40 ? 0.7 : 0.85));
-  else if (perf.avg < 14 && renderer.scale < 1) renderer.scale = Math.min(1, renderer.scale * 1.08);
-  perf.reflections = !(renderer.scale <= minScale + 0.01 && perf.avg > 24);
+function rotate(dx, dy) {
+  if (state.camMode === 'fly' || state.camMode === 'ground') {
+    cam.fyaw -= dx * 0.004; cam.fpitch = Math.max(-1.45, Math.min(1.45, cam.fpitch - dy * 0.004));
+  } else {
+    cam.yaw -= dx * 0.005; cam.pitch = Math.max(-0.2, Math.min(1.45, cam.pitch + dy * 0.004));
+  }
 }
+function pan(dx, dy) {
+  if (state.camMode !== 'orbit' && state.camMode !== 'cinematic') return;
+  const k = cam.dist * 0.0012;
+  const r = [Math.cos(cam.yaw), 0, -Math.sin(cam.yaw)];
+  cam.target = v3.add(cam.target, v3.scale(r, -dx * k));
+  cam.target[1] = Math.max(0, Math.min(4000, cam.target[1] + dy * k));
+}
+function zoomBy(d) {
+  if (state.camMode === 'fly') { cam.pos = v3.add(cam.pos, v3.scale(flyForward(), -d * 400)); return; }
+  if (state.camMode === 'ground') { state.fov = Math.max(0.25, Math.min(1.6, state.fov * Math.exp(d))); return; }
+  cam.dist = Math.max(60, Math.min(30000, cam.dist * Math.exp(d)));
+}
+function flyForward() { return [Math.sin(cam.fyaw) * Math.cos(cam.fpitch), Math.sin(cam.fpitch), Math.cos(cam.fyaw) * Math.cos(cam.fpitch)]; }
+
+function setupVirtualPads() {
+  const pads = document.querySelectorAll('.vpad');
+  pads.forEach((pad) => {
+    const knob = pad.querySelector('.knob');
+    let id = null, cx = 0, cy = 0;
+    const R = 46;
+    const set = (x, y) => {
+      const l = Math.hypot(x, y), k = l > R ? R / l : 1;
+      x *= k; y *= k;
+      knob.style.transform = `translate(${x}px,${y}px)`;
+      const nx = x / R, ny = y / R;
+      if (pad.dataset.role === 'move') { input.moveX = nx; input.moveY = ny; } else { input.orbitX = nx; input.orbitY = ny; }
+    };
+    pad.addEventListener('pointerdown', (e) => {
+      id = e.pointerId; pad.setPointerCapture(id);
+      const r = pad.getBoundingClientRect(); cx = r.left + r.width / 2; cy = r.top + r.height / 2;
+      set(e.clientX - cx, e.clientY - cy); e.preventDefault();
+    });
+    pad.addEventListener('pointermove', (e) => { if (e.pointerId === id) set(e.clientX - cx, e.clientY - cy); });
+    const end = (e) => { if (e.pointerId === id) { id = null; set(0, 0); } };
+    pad.addEventListener('pointerup', end);
+    pad.addEventListener('pointercancel', end);
+  });
+  const hold = (sel, field, v) => {
+    const b = $(sel);
+    b.addEventListener('pointerdown', (e) => { input[field] = v; e.preventDefault(); });
+    for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) b.addEventListener(ev, () => { input[field] = 0; });
+  };
+  hold('#vp-zin', 'zoom', -1); hold('#vp-zout', 'zoom', 1);
+  hold('#vp-up', 'up', 1); hold('#vp-down', 'up', -1);
+  $('#vp-strike').addEventListener('click', strike);
+}
+
+const padPrev = {};
+function pollGamepad(dt) {
+  const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+  let gp = null;
+  for (const g of gps) if (g && g.connected) { gp = g; break; }
+  $('#gp-status').textContent = gp ? '🎮 ' + gp.id.slice(0, 28) : '';
+  if (!gp) return { mx: 0, my: 0, ox: 0, oy: 0, z: 0, u: 0 };
+  const dz = (v) => (Math.abs(v) < 0.12 ? 0 : v);
+  const b = (i) => gp.buttons[i] && gp.buttons[i].pressed;
+  const edge = (i) => { const p = b(i), was = padPrev[i]; padPrev[i] = p; return p && !was; };
+  if (edge(0)) strike();
+  if (edge(1)) cycleCamera();
+  if (edge(2)) toggleMic();
+  if (edge(3)) togglePanel();
+  if (edge(9)) togglePause();
+  if (edge(8)) resetCamera();
+  if (edge(12)) nudge('activity', 2);
+  if (edge(13)) nudge('activity', -2);
+  if (edge(14)) nudge('eta', -0.25);
+  if (edge(15)) nudge('eta', 0.25);
+  const lt = gp.buttons[6] ? gp.buttons[6].value : 0, rt = gp.buttons[7] ? gp.buttons[7].value : 0;
+  return { mx: dz(gp.axes[0] || 0), my: dz(gp.axes[1] || 0), ox: dz(gp.axes[2] || 0), oy: dz(gp.axes[3] || 0), z: lt - rt, u: (b(5) ? 1 : 0) - (b(4) ? 1 : 0) };
+}
+function nudge(id, d) {
+  const sd = sliders.find((s) => s.id === id), el = $('#s-' + id);
+  el.value = Math.min(sd.max, Math.max(sd.min, parseFloat(el.value) + d));
+  sd.apply();
+  toast(`${sd.label}: ${$('#v-' + id).textContent}`);
+}
+
+// ------------------------------------------------------------------ actions
+function strike() { wasm.trigger(); flashButton('#btn-strike'); }
+function togglePause() { state.paused = !state.paused; $('#btn-pause').textContent = state.paused ? '▶' : '⏸'; toast(state.paused ? 'Paused' : 'Running'); }
+function togglePanel() { document.body.classList.toggle('panel-hidden'); }
+const CAMS = ['orbit', 'cinematic', 'ground', 'fly', 'strike'];
+const CAM_NAMES = { orbit: 'Orbit', cinematic: 'Cinematic', ground: 'Ground observer', fly: 'Free fly', strike: 'Strike-point chase' };
+function cycleCamera() { setCamera(CAMS[(CAMS.indexOf(state.camMode) + 1) % CAMS.length]); }
+function setCamera(m) {
+  state.camMode = m;
+  if (m === 'ground') { cam.pos = [0, 1.7, 3800]; cam.fyaw = Math.PI; cam.fpitch = 0.32; state.fov = 70 * Math.PI / 180; }
+  else state.fov = 55 * Math.PI / 180;
+  if (m === 'fly') { cam.pos = [...cam.eye]; const d = v3.norm(v3.sub(cam.look, cam.eye)); cam.fyaw = Math.atan2(d[0], d[2]); cam.fpitch = Math.asin(d[1]); }
+  $('#btn-cam').textContent = '🎥 ' + CAM_NAMES[m];
+  $('#sel-cam').value = m;
+  toast('Camera: ' + CAM_NAMES[m]);
+}
+function resetCamera() { cam.target = [0, 1300, 0]; cam.yaw = 0.35; cam.pitch = 0.05; cam.dist = 4300; setCamera('orbit'); }
+
+function toggleFullscreen() {
+  const d = document, el = d.documentElement;
+  const fs = d.fullscreenElement || d.webkitFullscreenElement;
+  if (!fs) (el.requestFullscreen || el.webkitRequestFullscreen).call(el, { navigationUI: 'hide' })?.catch?.(() => {});
+  else (d.exitFullscreen || d.webkitExitFullscreen).call(d);
+}
+document.addEventListener('fullscreenchange', () => { $('#btn-fs').classList.toggle('on', !!document.fullscreenElement); });
+
+async function toggleMic() {
+  if (state.mic) {
+    audio.disableMic(); state.mic = false;
+    wasm.set_param(P.micLevel, 0);
+    $('#btn-mic').classList.remove('on'); $('#mic-meter').hidden = true;
+    toast('Microphone off');
+    return;
+  }
+  try {
+    await audio.enableMic();
+    state.mic = true;
+    $('#btn-mic').classList.add('on'); $('#mic-meter').hidden = false;
+    toast('Microphone on — shout, clap or whistle to drive the storm');
+    updateAudioInfo();
+  } catch (e) {
+    toast('Microphone unavailable: ' + e.message);
+  }
+}
+
+let toastT = 0;
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 2200); }
+function flashButton(s) { const b = $(s); b.classList.add('hit'); setTimeout(() => b.classList.remove('hit'), 200); }
+
+// ------------------------------------------------------------------ camera update
+function updateCamera(dt, gp, stats) {
+  const mx = input.moveX + gp.mx + (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  const my = input.moveY + gp.my + (keys.has('KeyS') ? 1 : 0) - (keys.has('KeyW') ? 1 : 0);
+  const ox = input.orbitX + gp.ox + (keys.has('ArrowRight') ? 1 : 0) - (keys.has('ArrowLeft') ? 1 : 0);
+  const oy = input.orbitY + gp.oy + (keys.has('ArrowDown') ? 1 : 0) - (keys.has('ArrowUp') ? 1 : 0);
+  const zz = input.zoom + gp.z + (keys.has('Minus') ? 1 : 0) - (keys.has('Equal') ? 1 : 0);
+  const uu = input.up + gp.u + (keys.has('KeyE') ? 1 : 0) - (keys.has('KeyQ') ? 1 : 0);
+  const m = state.camMode;
+  if (m === 'fly' || m === 'ground') {
+    cam.fyaw -= ox * dt * 1.6; cam.fpitch = Math.max(-1.45, Math.min(1.45, cam.fpitch - oy * dt * 1.2));
+    const f = flyForward(), r = [-Math.cos(cam.fyaw), 0, Math.sin(cam.fyaw)];
+    if (m === 'fly') {
+      const sp = 150 + Math.abs(cam.pos[1]) * 0.8;
+      cam.pos = v3.add(cam.pos, v3.scale(f, -my * sp * dt));
+      cam.pos = v3.add(cam.pos, v3.scale(r, -mx * sp * dt));
+      cam.pos[1] = Math.max(2, cam.pos[1] + uu * sp * dt);
+      if (zz) zoomBy(zz * dt * 2);
+    } else {
+      const fl = v3.norm([f[0], 0, f[2]]);
+      cam.pos = v3.add(cam.pos, v3.scale(fl, -my * 6 * dt));
+      cam.pos = v3.add(cam.pos, v3.scale(r, -mx * 6 * dt));
+      if (zz) zoomBy(zz * dt);
+    }
+    cam.eye = [...cam.pos];
+    cam.look = v3.add(cam.pos, f);
+    return;
+  }
+  cam.yaw -= (ox + mx) * dt * 1.2;
+  cam.pitch = Math.max(-0.2, Math.min(1.45, cam.pitch + (oy + my * 0.5) * dt * 0.9));
+  if (zz) zoomBy(zz * dt * 1.5);
+  cam.target[1] = Math.max(0, Math.min(4000, cam.target[1] + uu * dt * 800));
+  let target = cam.target, dist = cam.dist;
+  if (m === 'cinematic') {
+    cam.yaw += dt * 0.05;
+    const wob = Math.sin(state.time * 0.07) * 0.2;
+    dist = cam.dist * (1 + wob);
+  }
+  if (m === 'strike' || m === 'cinematic') {
+    const gpnt = stats[23] >= 0 ? [stats[9], m === 'strike' ? 600 : 1250, stats[11]] : cam.target;
+    cam.smoothT = cam.smoothT ? v3.lerp(cam.smoothT, gpnt, 1 - Math.exp(-dt * 1.5)) : gpnt;
+    target = cam.smoothT;
+    if (m === 'strike') dist = Math.min(cam.dist, 2200);
+  }
+  const cp = Math.cos(cam.pitch);
+  cam.eye = [target[0] + Math.sin(cam.yaw) * cp * dist, Math.max(3, target[1] + Math.sin(cam.pitch) * dist), target[2] + Math.cos(cam.yaw) * cp * dist];
+  cam.look = target;
+}
+
+// ------------------------------------------------------------------ main loop
+let last = performance.now(), fpsAcc = 0, fpsN = 0, fps = 0, physMs = 0, hudT = 0;
 function frame(now) {
-  const dt = Math.min(0.05, (now - last) / 1000);
-  adapt(now - last);
-  last = now;
-  const t = now / 1000;
-  const [w, h] = renderer.resize();
-  const half = [HY * w / h, HY, HZ];
-  wasm.set_box(half[0], half[1], half[2]);
-  if (ui.micOn) {
-    const m = sound.analyse(t);
-    wasm.set_param(P.mic, m.level);
-    if (m.onset) wasm.strike();
-    $('#mic-bar').style.transform = `scaleX(${m.level.toFixed(3)})`;
-  }
-  const n = wasm.step(dt);
-  const info = f32(wasm.info_ptr(), 16);
-  drawQubits();
-
-  // eye in front of the glass: slow automatic drift (Lissajous) + drag offset relaxing back
-  view.dragX *= Math.exp(-dt * 0.4); view.dragY *= Math.exp(-dt * 0.4);
-  const D = HY / Math.tan(FOV / 2);
-  const sx = (0.45 * Math.sin(t * 0.11) + 0.15 * Math.sin(t * 0.27 + 1.3)) * ui.sway + view.dragX;
-  const sy = (0.30 * Math.sin(t * 0.083 + 0.7) + 0.10 * Math.sin(t * 0.21)) * ui.sway + view.dragY;
-  const eye = [sx * half[0], sy * half[1], HZ + D];
-  const cam = renderer.windowCamera(eye, half);
-
-  const nb = info[11] | 0;
-  const blobs = f32(wasm.blob_ptr(), 12 * 8);
-  for (let i = 0; i < nb; i++) {
-    blobPos.set([blobs[i * 8], blobs[i * 8 + 1], blobs[i * 8 + 2], blobs[i * 8 + 3]], i * 4);
-    const [r, g, b, B] = Renderer.sample(renderer.bb, blobs[i * 8 + 4]);
-    blobCol.set([r, g, b, B * 0.3], i * 4);
-  }
-  const act = Math.min(2, Math.log1p(info[2]) * 0.7);
-  const lc = Renderer.sample(renderer.lut, Math.max(9000, info[6]));
-  if (ui.soundOn) {
-    const pan = Math.max(-1, Math.min(1, info[8] / half[0]));
-    for (let i = 0; i < Math.min(2, info[0]); i++) sound.thunder(0.8 + Math.random() * 0.4, pan);
-    if (info[1] > 0) sound.thunder(0.4, pan);
-  }
-  renderer.render({
-    cam, eye, half, time: t,
-    segs: f32(wasm.seg_ptr(), Math.max(1, n) * 8), segCount: n,
-    light: [info[3], info[4], info[5], act], lightColor: [lc[0], lc[1], lc[2]],
-    blobPos, blobCol, nBlobs: 0, lava: 0,
-    reflect: ui.reflect, reflections: perf.reflections, mist: ui.mist, gain: ui.gain, thickness: ui.thickness, bloom: ui.bloom,
-  });
   requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+  state.time += dt;
+
+  const gp = pollGamepad(dt);
+  // microphone
+  if (state.mic) {
+    const m = audio.analyseMic(state.time);
+    wasm.set_param(P.micLevel, m.level);
+    wasm.set_param(P.micPitch, m.pitch);
+    if (m.onset) strike();
+    $('#mic-bar').style.width = (m.level * 100).toFixed(1) + '%';
+    $('#mic-pitch').style.left = (m.pitch * 100).toFixed(1) + '%';
+    $('#mic-txt').textContent = `${m.db.toFixed(0)} dBFS · centroid ${m.centroid.toFixed(0)} Hz`;
+  }
+
+  let stats0 = f32(wasm.stats_ptr(), 24);
+  updateCamera(dt, gp, stats0);
+  const fwd = v3.sub(cam.look, cam.eye);
+  wasm.set_listener(cam.eye[0], cam.eye[1], cam.eye[2], fwd[0], fwd[2]);
+
+  const t0 = performance.now();
+  const n = state.paused ? wasm.step(0) : wasm.step(dt);
+  // thunder synthesis on each return stroke
+  if (wasm.thunder_pending()) requestThunder();
+  if (audio && audio.ctx) audio.setListener(v3.sub(cam.look, cam.eye), [0, 1, 0]);
+  physMs = physMs * 0.9 + (performance.now() - t0) * 0.1;
+
+  const stats = f32(wasm.stats_ptr(), 24);
+  const light = f32(wasm.light_ptr(), 8);
+  const segs = f32(wasm.seg_ptr(), Math.max(1, n) * 8);
+  const gIdx = stats[23];
+  let gInt = 0;
+  if (gIdx >= 0 && light[7] > 0) gInt = Math.pow(light[7] / 10000, 4) * 0.02 * (stats[0] === 2 || stats[0] === 5 || stats[0] === 3 ? 1 : 0);
+
+  // thunder ETA bookkeeping
+  if (stats[0] === 2 && (stats[1] !== state.lastStroke || stats[18] !== state.lastFlash)) {
+    state.lastStroke = stats[1]; state.lastFlash = stats[18];
+    const d = v3.len(v3.sub([stats[9], stats[10], stats[11]], cam.eye));
+    state.strikeDist = d;
+    state.thunderETA.push(state.time + d / 343);
+  }
+  state.thunderETA = state.thunderETA.filter((t) => t > state.time - 0.5);
+
+  renderer.render({
+    eye: cam.eye, target: cam.look, fov: state.fov, time: state.time,
+    light, ground: [stats[9], stats[10] + 2, stats[11], gInt],
+    tower: stats[17] > 0 ? [stats[15], stats[16], stats[17]] : null,
+    segs, segCount: n, cloudBase: CLOUD_BASE, cloudTop: CLOUD_TOP, ambient: state.ambient, flashK: state.flashK,
+    exposure: state.exposure, bloom: state.bloom, bloomRadius: state.bloomRadius, coreWidth: state.coreWidth, boltGain: state.boltGain, rain: state.rain,
+  });
+
+  hudT -= dt;
+  if (hudT <= 0) { hudT = 0.1; updateHUD(stats, n); }
 }
 
+function sci(x) { if (!isFinite(x) || x <= 0) return '—'; const e = Math.floor(Math.log10(x)); return (x / 10 ** e).toFixed(2) + '×10' + sup(e); }
+function sup(e) { const m = { '-': '⁻', 0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹' }; return String(e).split('').map((c) => m[c]).join(''); }
+
+function updateHUD(st, n) {
+  const ph = st[0] | 0;
+  $('#h-phase').textContent = PHASES[ph];
+  $('#h-phase').dataset.phase = ph;
+  $('#h-stroke').textContent = ph >= 2 ? `${Math.min(st[1] + 1, st[2]) | 0} / ${st[2] | 0}` : `— / ${st[2] | 0}`;
+  $('#h-ipk').textContent = st[3] > 0 ? st[3].toFixed(1) + ' kA' : '—';
+  $('#h-temp').textContent = st[4] > 0 ? Math.round(st[4]).toLocaleString() + ' K' : '—';
+  const tm = Math.max(0, Math.min(1, (st[4] - wasm.lut_tmin()) / (wasm.lut_tmax() - wasm.lut_tmin())));
+  $('#lut-mark').style.left = (tm * 100).toFixed(1) + '%';
+  $('#lut-mark').style.opacity = st[4] > 900 ? 1 : 0.2;
+  $('#h-field').textContent = st[5] > 0 ? (st[5] / 1000).toFixed(0) + ' kV/m' : '—';
+  $('#h-fn').textContent = sci(st[7]) + ' A/m²';
+  $('#h-alt').textContent = ph === 1 ? Math.round(st[6]) + ' m' : '—';
+  $('#h-len').textContent = st[13] > 0 ? (st[13] / 1000).toFixed(2) + ' km' : '—';
+  $('#h-nodes').textContent = (st[8] | 0) + ' cells · ' + n + ' segs';
+  const eta = state.thunderETA.length ? state.thunderETA[state.thunderETA.length - 1] - state.time : -1;
+  $('#h-dist').textContent = state.strikeDist > 0 ? (state.strikeDist / 1000).toFixed(2) + ' km' : '—';
+  $('#h-thunder').textContent = eta > 0 ? `arrives in ${eta.toFixed(1)} s` : (state.strikeDist > 0 ? 'heard' : '—');
+  $('#h-next').textContent = ph === 0 ? `next flash ≈ ${Math.max(0, st[22]).toFixed(1)} s` : '';
+  $('#h-perf').textContent = `${fps.toFixed(0)} fps · physics ${physMs.toFixed(2)} ms · WASM+SIMD`;
+}
+
+// ------------------------------------------------------------------ boot
 async function boot() {
-  try { renderer = new Renderer($('#view')); }
-  catch (e) {
-    // WebGL2 missing or its shaders failed: switch to the Canvas 2D renderer on a fresh canvas
-    console.warn('WebGL2 renderer unavailable, using Canvas 2D:', e.message);
+  let compat = false;
+  try {
+    renderer = new Renderer($('#view'));
+  } catch (e) {
+    // no WebGL2 (or its shaders failed): use the Canvas 2D storm renderer on a fresh canvas
+    console.warn('WebGL2 unavailable, using Canvas 2D:', e.message);
     const old = $('#view'), cv = document.createElement('canvas');
     cv.id = 'view'; old.replaceWith(cv);
-    try { renderer = new Renderer2D(cv); }
-    catch (e2) { document.body.insertAdjacentHTML('beforeend', `<p class="err">${e2.message}</p>`); return; }
-    const note = document.createElement('div');
-    note.className = 'note';
-    note.textContent = 'Compatibility mode (WebGL2 unavailable) — enable hardware acceleration in your browser for full quality.';
-    document.body.appendChild(note);
-    setTimeout(() => note.classList.add('hide'), 7000);
+    try { renderer = new Renderer2D(cv); compat = true; }
+    catch (e2) { $('#start-msg').textContent = 'Error: ' + e2.message; return; }
   }
-  const bytes = await (await fetch('lightning.wasm')).arrayBuffer();
-  wasm = (await WebAssembly.instantiate(bytes, {})).instance.exports;
-  wasm.init((Math.random() * 2 ** 31) >>> 0);
-  renderer.setLUT(f32(wasm.lut_ptr(), wasm.lut_len() * 4).slice(), wasm.lut_len(), wasm.lut_tmin(), wasm.lut_tmax());
-  renderer.setBlackbody(f32(wasm.bb_ptr(), wasm.bb_len() * 4).slice(), wasm.bb_len(), wasm.bb_tmin(), wasm.bb_tmax());
-  const [w, h] = renderer.resize();
-  wasm.set_box(HY * w / h, HY, HZ);
+  audio = new AudioEngine();
+  try { await loadWasm(); } catch (e) { $('#start-msg').textContent = 'Could not load lightning.wasm: ' + e.message; return; }
+  initSim();
   buildPanel();
   setupInput();
+  $('#btn-strike').onclick = strike;
+  $('#btn-cam').onclick = cycleCamera;
+  $('#btn-mic').onclick = toggleMic;
+  $('#btn-fs').onclick = toggleFullscreen;
+  $('#btn-panel').onclick = togglePanel;
+  $('#btn-pause').onclick = togglePause;
+  $('#btn-pad').onclick = () => document.body.classList.toggle('show-pads');
+  $('#btn-reset').onclick = resetCamera;
+  $('#sel-cam').onchange = (e) => setCamera(e.target.value);
+  document.body.classList.add('panel-hidden');
+  if (matchMedia('(pointer: coarse)').matches) document.body.classList.add('show-pads');
+  // auto-hide the interface after a few seconds without input (clean view)
+  let idleT = 0;
+  const poke = () => {
+    document.body.classList.remove('idle');
+    clearTimeout(idleT);
+    idleT = setTimeout(() => { if (document.body.classList.contains('panel-hidden')) document.body.classList.add('idle'); }, 3000);
+  };
+  for (const ev of ['pointermove', 'pointerdown', 'keydown', 'wheel', 'touchstart']) window.addEventListener(ev, poke, { passive: true });
   poke();
-  window.__lm = { wasm, togglePanel, ui, perf, get renderer() { return renderer; } };
-  requestAnimationFrame((tt) => { last = tt; frame(tt); });
+  const go = async (withAudio) => {
+    $('#start').classList.add('gone');
+    if (withAudio) { try { await audio.start(); audio.setVolume(state.volume); audio.setRain(state.rain); } catch (e) { console.warn(e); } }
+    updateAudioInfo();
+  };
+  $('#start-go').onclick = () => go(true);
+  $('#start-fs').onclick = () => { toggleFullscreen(); go(true); };
+  $('#start-mute').onclick = () => go(false);
+  $('#start-msg').textContent = compat ? 'Ready — compatibility mode (WebGL2 not available in this browser).' : renderer.floatOK ? 'Ready.' : 'Ready (no float render targets — reduced HDR).';
+  setCamera('orbit');
+  requestAnimationFrame((t) => { last = t; frame(t); });
+  window.__lm = { wasm, state, cam, setCamera, strike, audio };
 }
 boot();
