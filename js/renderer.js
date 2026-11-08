@@ -1,4 +1,4 @@
-// WebGL2 HDR renderer for the glass lightning chamber (smooth or ASCII output).
+// WebGL2 HDR renderer for the glass lightning chamber.
 //
 //  * Off-axis ("window") projection (Kooima's generalised perspective): the front glass of
 //    the chamber is mapped exactly onto the screen for any eye position → the screen is
@@ -16,11 +16,10 @@ void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); v_uv=p; gl_Positi
 
 const ARC_VS = `#version 300 es
 precision highp float;
-layout(location=0) in vec3 a_p0; layout(location=1) in vec3 a_p1; layout(location=2) in vec2 a_tw; layout(location=3) in float a_gas;
+layout(location=0) in vec3 a_p0; layout(location=1) in vec3 a_p1; layout(location=2) in vec2 a_tw;
 uniform mat4 u_vp; uniform mat4 u_model; uniform vec2 u_res; uniform float u_pxPerM; uniform float u_width; uniform float u_minPx;
 uniform vec3 u_eye;
-uniform sampler2D u_lut; uniform vec2 u_lutRange; uniform float u_mist; uniform float u_rows;
-out float v_gas;
+uniform sampler2D u_lut; uniform vec2 u_lutRange; uniform float u_mist;
 out float v_across; out float v_T; out float v_gain; out float v_along; flat out float v_L; flat out float v_hw; flat out float v_cap; out vec3 v_world;
 void main(){
   int id = gl_VertexID; float side = (id&1)==0 ? -1.0 : 1.0; bool e0 = id<2;
@@ -35,8 +34,7 @@ void main(){
   vec4 c = e0 ? c0 : c1;
   float cap = a_tw.y < 0.0 ? 1.0 : 0.0;
   // cooling channels expand and diffuse into mist (same total light, wider and softer)
-  v_gas = (a_gas + 0.5)/u_rows;
-  float B = textureLod(u_lut, vec2(clamp((a_tw.x-u_lutRange.x)/(u_lutRange.y-u_lutRange.x),0.0,1.0),v_gas), 0.0).a;
+  float B = textureLod(u_lut, vec2(clamp((a_tw.x-u_lutRange.x)/(u_lutRange.y-u_lutRange.x),0.0,1.0),0.5), 0.0).a;
   float spread = 1.0 + u_mist*3.0*clamp(1.0 - B, 0.0, 1.0);
   float wTrue = u_width*abs(a_tw.y)*u_pxPerM/c.w*spread;     // metres → pixels at this depth
   float wpx = max(wTrue, u_minPx);
@@ -50,12 +48,11 @@ void main(){
 }`;
 const ARC_FS = `#version 300 es
 precision highp float;
-in float v_across; in float v_T; in float v_gain; in float v_along; flat in float v_L; flat in float v_hw; flat in float v_cap; in vec3 v_world; in float v_gas;
+in float v_across; in float v_T; in float v_gain; in float v_along; flat in float v_L; flat in float v_hw; flat in float v_cap; in vec3 v_world;
 out vec4 o;
 uniform sampler2D u_lut; uniform vec2 u_lutRange; uniform float u_gain, u_sharp;
 uniform vec3 u_eye; uniform vec3 u_half;
 uniform vec4 u_plane;    // mirror plane n·x = d (n = 0 → direct view)
-uniform vec2 u_depth;    // near, far distance for the depth channel
 uniform float u_reflect; // reflectance multiplier (1 = clean glass)
 void main(){
   float R = 1.0;
@@ -72,19 +69,16 @@ void main(){
     float c = abs(dot(normalize(dir), u_plane.xyz));
     R = (0.04 + 0.96*pow(1.0 - c, 5.0)) * u_reflect;
   }
-  vec4 lut = texture(u_lut, vec2(clamp((v_T-u_lutRange.x)/(u_lutRange.y-u_lutRange.x),0.0,1.0),v_gas));
+  vec4 lut = texture(u_lut, vec2(clamp((v_T-u_lutRange.x)/(u_lutRange.y-u_lutRange.x),0.0,1.0),0.5));
   float dEnd = v_cap > 0.5 ? max(v_along - v_L, 0.0)/max(v_hw,1e-3) : 0.0;
   float g = exp(-v_across*v_across*u_sharp) * exp(-dEnd*dEnd*u_sharp);
-  vec3 rgb = lut.rgb*lut.a*g*v_gain*u_gain*R;
-  // alpha accumulates luminance × depth (additively) → per-pixel weighted depth for 3-D ASCII
-  float d = clamp((length(v_world - u_eye) - u_depth.x) / (u_depth.y - u_depth.x), 0.0, 1.0);
-  o = vec4(rgb, dot(rgb, vec3(0.2126,0.7152,0.0722)) * d);
+  o = vec4(lut.rgb*lut.a*g*v_gain*u_gain*R, 1.0);
 }`;
 
 const CHAMBER_FS = `#version 300 es
 precision highp float;
 in vec2 v_uv; out vec4 o;
-uniform vec3 u_eye; uniform vec3 u_half; uniform float u_time; uniform vec2 u_depth;
+uniform vec3 u_eye; uniform vec3 u_half; uniform float u_time;
 uniform vec4 u_light; uniform vec3 u_lcol;     // discharge: xyz centroid, w strength
 float hash(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
 float vnoise(vec3 p){ vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
@@ -126,8 +120,7 @@ void main(){
   float Rf = 0.04 + 0.96*pow(1.0 - cosv, 5.0);
   float streak = smoothstep(0.35, 0.0, abs((v_uv.x - v_uv.y*0.6) - 0.25 - 0.05*sin(u_time*0.1)))*0.012;
   col += vec3(0.6,0.65,0.8)*(Rf*0.04 + streak);
-  float dw = clamp((length(H - u_eye) - u_depth.x) / (u_depth.y - u_depth.x), 0.0, 1.0);
-  o = vec4(col, dot(col, vec3(0.2126,0.7152,0.0722)) * dw);
+  o = vec4(col, 1.0);
 }`;
 
 const BLOB_VS = `#version 300 es
@@ -195,89 +188,10 @@ uniform sampler2D u_hdr, u_bloom; uniform float u_bloomK, u_time;
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
 vec3 srgb(vec3 c){ return mix(c*12.92, 1.055*pow(c,vec3(1.0/2.4))-0.055, step(0.0031308,c)); }
 void main(){
-  vec4 hd = texture(u_hdr,v_uv);
-  vec3 c = srgb(aces(hd.rgb + texture(u_bloom,v_uv).rgb*(u_bloomK/6.0)));
+  vec3 c = srgb(aces(texture(u_hdr,v_uv).rgb + texture(u_bloom,v_uv).rgb*(u_bloomK/6.0)));
   vec2 q = v_uv - 0.5; c *= 1.0 - dot(q,q)*0.35;
   float n = fract(sin(dot(gl_FragCoord.xy+u_time, vec2(12.9898,78.233)))*43758.5453);
-  // depth (luminance-weighted) premultiplied by display luminance, so mip averages stay exact
-  float depth = clamp(hd.a / max(dot(hd.rgb, vec3(0.2126,0.7152,0.0722)), 1e-5), 0.0, 1.0);
-  c += (n-0.5)/255.0;
-  o = vec4(c, dot(c, vec3(0.2126,0.7152,0.0722)) * depth);
-}`;
-
-const ASCII_FS = `#version 300 es
-precision highp float;
-in vec2 v_uv; out vec4 o;
-uniform sampler2D u_scene, u_glyphs, u_glow;
-uniform float u_focus, u_dof;
-uniform vec2 u_res, u_cell, u_vanish; uniform float u_lod, u_glyphLod, u_nglyph, u_ramp, u_edge, u_glowK, u_time;
-float lum(vec2 uv){ return dot(textureLod(u_scene, uv, u_lod).rgb, vec3(0.2126,0.7152,0.0722)); }
-float g_lodBias = 0.0;
-float glyphA(float gi, vec2 l){
-  if (l.x < 0.0 || l.y < 0.0 || l.x > 1.0 || l.y > 1.0) return 0.0;
-  return textureLod(u_glyphs, vec2((gi + l.x) / u_nglyph, 1.0 - l.y), u_glyphLod + g_lodBias).r;
-}
-void main(){
-  vec2 frag = gl_FragCoord.xy;
-  vec2 id = floor(frag / u_cell);
-  vec2 cs = u_cell / u_res;
-  vec2 cc = (id + 0.5) * cs;                       // cell centre (uv)
-  // Gaussian-weighted cell sample (3×3 taps over the mip level, σ ≈ 0.6 cell)
-  vec4 acc = vec4(0.0); float wsum = 0.0;
-  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
-    float wgt = exp(-float(i*i + j*j) / (2.0 * 0.6 * 0.6));
-    acc += textureLod(u_scene, cc + cs * vec2(float(i), float(j)) * 0.5, u_lod) * wgt;
-    wsum += wgt;
-  }
-  acc /= wsum;
-  vec3 col = acc.rgb;
-  float L = dot(col, vec3(0.2126,0.7152,0.0722));
-  // Sobel gradient of the cell-averaged luminance → edge strength and orientation
-  float tl = lum(cc + cs*vec2(-1, 1)), tc = lum(cc + cs*vec2(0, 1)), tr = lum(cc + cs*vec2(1, 1));
-  float ml = lum(cc + cs*vec2(-1, 0)),                                  mr = lum(cc + cs*vec2(1, 0));
-  float bl = lum(cc + cs*vec2(-1,-1)), bc = lum(cc + cs*vec2(0,-1)), br = lum(cc + cs*vec2(1,-1));
-  vec2 g = vec2((tr + 2.0*mr + br) - (tl + 2.0*ml + bl), (tl + 2.0*tc + tr) - (bl + 2.0*bc + br));
-  float mag = length(g);
-  float glyph;
-  // thin channels cover only part of a cell: perceptual boost (Stevens-like exponent)
-  float Lb = pow(L, 0.55);
-  if (mag > u_edge && L > 0.06) {
-    // edge orientation ⟂ gradient, quantised to 4 directions (dash, slash, bar, backslash)
-    float e = atan(g.y, g.x) + 1.5707963;
-    float k = floor(mod(e + 0.3926991, 3.1415927) / 0.7853982);
-    glyph = u_ramp + k;
-  } else {
-    glyph = L < 0.045 ? 0.0 : floor(clamp(Lb * 1.1, 0.0, 0.999) * u_ramp);
-  }
-  // ---- 3-D: depth of the light in this cell (0 near … 1 far)
-  float d = clamp(acc.a / max(L, 1e-4), 0.0, 1.0);
-  // Gaussian depth of field around a drifting focal depth
-  float blur = u_dof > 0.0 ? 1.0 - exp(-(d - u_focus) * (d - u_focus) / (2.0 * u_dof * u_dof)) : 0.0;
-  float scale = mix(1.18, 0.5, d);                  // perspective: near glyphs big, far glyphs small
-  vec2 local = fract(frag / u_cell);
-  vec2 lf = (local - 0.5) / scale + 0.5;           // glyph front face
-  // extrusion toward the vanishing point of the current viewpoint (solid block letters)
-  vec2 dirPx = u_vanish - frag;
-  vec2 dir = dirPx / max(length(dirPx), 1.0);
-  float depthLen = mix(0.34, 0.08, d);              // nearer letters show a longer side
-  vec2 stepL = dir * vec2(u_cell.y / u_cell.x, 1.0) * depthLen / 4.0;
-  g_lodBias = blur * 2.6;                            // defocused glyphs sample a blurrier mip
-  float front = glyphA(glyph, lf) * (1.0 - 0.35 * blur);
-  float side = 0.0, shade = 0.0;
-  for (int k = 1; k <= 4; k++) {
-    float sa = glyphA(glyph, lf - stepL * float(k) / scale);
-    if (sa > side) { side = sa; shade = float(k) / 4.0; }
-  }
-  // glyph colour: spectral hue, whitening as it saturates; depth haze dims and cools far glyphs
-  float m = max(max(col.r, col.g), max(col.b, 1e-4));
-  vec3 hue = col / m;
-  vec3 gc = mix(hue, vec3(1.0), smoothstep(0.45, 0.9, Lb) * 0.7) * (0.35 + 1.4 * Lb);
-  gc *= mix(1.2, 0.55, d);
-  gc = mix(gc, gc * vec3(0.75, 0.85, 1.1), d * 0.5);
-  vec3 sideCol = gc * (0.42 - 0.3 * shade);          // darker extruded flanks
-  vec3 glyphRGB = mix(sideCol * side, gc, front);
-  vec3 glow = (1.0 - exp(-texture(u_glow, v_uv).rgb * 0.6)) * u_glowK;
-  o = vec4(glyphRGB + glow, 1.0);
+  o = vec4(c + (n-0.5)/255.0, 1.0);
 }`;
 
 function compile(gl, vs, fs) {
@@ -355,67 +269,35 @@ export class Renderer {
     this.down = compile(gl, FS_TRI, DOWN_FS);
     this.up = compile(gl, FS_TRI, UP_FS);
     this.comp = compile(gl, FS_TRI, COMP_FS);
-    this.ascii = compile(gl, FS_TRI, ASCII_FS);
-    this._buildGlyphs();
     this.emptyVao = gl.createVertexArray();
     this.arcVao = gl.createVertexArray();
     this.arcBuf = gl.createBuffer();
     gl.bindVertexArray(this.arcVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.arcBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, 4 * 9 * 60000, gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0); gl.vertexAttribDivisor(0, 1);
-    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 36, 12); gl.vertexAttribDivisor(1, 1);
-    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 36, 24); gl.vertexAttribDivisor(2, 1);
-    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 36, 32); gl.vertexAttribDivisor(3, 1);
+    gl.bufferData(gl.ARRAY_BUFFER, 4 * 8 * 60000, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(0, 1);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12); gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 32, 24); gl.vertexAttribDivisor(2, 1);
     gl.bindVertexArray(null);
     this.lutTex = gl.createTexture();
     this.scale = 1; this.w = this.h = 0;
   }
 
-  /** data: rows × n × [r,g,b,brightness] (one row per gas) */
-  setLUT(data, n, rows, tmin, tmax) {
+  setLUT(data, n, tmin, tmax) {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, n, rows, 0, gl.RGBA, gl.FLOAT, data);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, n, 1, 0, gl.RGBA, gl.FLOAT, data);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     this.lutRange = [tmin, tmax];
-    this.lut = { data, n, rows, tmin, tmax };
+    this.lut = { data, n, tmin, tmax };
   }
   setBlackbody(data, n, tmin, tmax) { this.bb = { data, n, tmin, tmax }; }
-  /** Colour-table lookup; `row` may be fractional (blends adjacent gases). */
-  static sample(t, T, row = 0) {
+  static sample(t, T) {
     const i = Math.round(Math.min(1, Math.max(0, (T - t.tmin) / (t.tmax - t.tmin))) * (t.n - 1));
-    const r0 = Math.floor(row), f = row - r0, rows = t.rows || 1;
-    const a = (Math.min(rows - 1, r0) * t.n + i) * 4, b = (Math.min(rows - 1, r0 + 1) * t.n + i) * 4;
-    return [0, 1, 2, 3].map((k) => t.data[a + k] * (1 - f) + t.data[b + k] * f);
-  }
-
-  /** Glyph atlas: brightness ramp + 4 edge glyphs, rendered from a monospace font. */
-  _buildGlyphs() {
-    const gl = this.gl;
-    this.glyphRamp = ' .`:,-~=+*ox%O#@';
-    const chars = this.glyphRamp + '-/|\\';
-    const cw = 32, ch = 48;
-    const cv = document.createElement('canvas');
-    cv.width = cw * chars.length; cv.height = ch;
-    const g = cv.getContext('2d');
-    g.fillStyle = '#000'; g.fillRect(0, 0, cv.width, cv.height);
-    g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.font = `bold ${Math.round(ch * 0.82)}px ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace`;
-    for (let i = 0; i < chars.length; i++) g.fillText(chars[i], i * cw + cw / 2, ch * 0.54);
-    this.glyphTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, this.glyphTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
-    gl.generateMipmap(gl.TEXTURE_2D);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    this.glyphCount = chars.length;
-    this.glyphCell = [cw, ch];
+    return [t.data[i * 4], t.data[i * 4 + 1], t.data[i * 4 + 2], t.data[i * 4 + 3]];
   }
 
   _tex(w, h) {
@@ -432,7 +314,6 @@ export class Renderer {
   resize() {
     const gl = this.gl;
     const dpr = Math.min(window.devicePixelRatio || 1, 1.5) * this.scale;
-    this.dprUsed = dpr;
     const w = Math.max(2, Math.floor(this.canvas.clientWidth * dpr));
     const h = Math.max(2, Math.floor(this.canvas.clientHeight * dpr));
     if (w !== this.w || h !== this.h) {
@@ -448,20 +329,6 @@ export class Renderer {
         this.targets.push({ tex, fbo, w: mw, h: mh });
         mw = Math.max(1, mw >> 1); mh = Math.max(1, mh >> 1);
       }
-      // tone-mapped scene for the ASCII pass (mipmapped → per-cell averages)
-      if (this.ldr) { gl.deleteTexture(this.ldr.tex); gl.deleteFramebuffer(this.ldr.fbo); }
-      const lt = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, lt);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-      gl.generateMipmap(gl.TEXTURE_2D);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      const lf = gl.createFramebuffer();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, lf);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, lt, 0);
-      this.ldr = { tex: lt, fbo: lf };
     }
     return [w, h];
   }
@@ -486,8 +353,6 @@ export class Renderer {
     gl.uniform3fv(p.u.u_eye, s.eye);
     gl.uniform3fv(p.u.u_half, s.half);
     gl.uniform1f(p.u.u_time, s.time);
-    const dNear = s.eye[2] - s.half[2], dFar = s.eye[2] + s.half[2] * 2.2;
-    gl.uniform2f(p.u.u_depth, dNear, dFar);
     gl.uniform4fv(p.u.u_light, s.light);
     gl.uniform3fv(p.u.u_lcol, s.lightColor);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -514,7 +379,7 @@ export class Renderer {
     if (s.segCount > 0) {
       gl.bindVertexArray(this.arcVao);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.arcBuf);
-      gl.bufferSubData(gl.ARRAY_BUFFER, 0, s.segs, 0, s.segCount * 9);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, s.segs, 0, s.segCount * 8);
       p = this.arc;
       gl.useProgram(p.p);
       gl.uniformMatrix4fv(p.u.u_vp, false, vp);
@@ -534,8 +399,6 @@ export class Renderer {
       }
       const k = s.thickness;
       gl.uniform1f(p.u.u_mist, s.mist);
-      gl.uniform1f(p.u.u_rows, this.lut.rows);
-      gl.uniform2f(p.u.u_depth, s.eye[2] - s.half[2], s.eye[2] + s.half[2] * 2.2);
       for (const [model, plane] of views) {
         gl.uniformMatrix4fv(p.u.u_model, false, model);
         gl.uniform4fv(p.u.u_plane, plane);
@@ -574,7 +437,7 @@ export class Renderer {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
     gl.disable(gl.BLEND);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, s.ascii ? this.ldr.fbo : null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, w, h);
     const c = this.comp;
     gl.useProgram(c.p);
@@ -583,34 +446,6 @@ export class Renderer {
     gl.uniform1f(c.u.u_bloomK, s.bloom);
     gl.uniform1f(c.u.u_time, s.time);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
-    if (s.ascii) {
-      // ASCII engine: per-cell average colour + Sobel edges → glyphs
-      gl.bindTexture(gl.TEXTURE_2D, this.ldr.tex);
-      gl.generateMipmap(gl.TEXTURE_2D);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.viewport(0, 0, w, h);
-      const a = this.ascii;
-      gl.useProgram(a.p);
-      const cellW = Math.max(4, Math.round(s.glyphSize * (this.dprUsed || 1)));
-      const cellH = Math.round(cellW * 1.5);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.ldr.tex); gl.uniform1i(a.u.u_scene, 0);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.glyphTex); gl.uniform1i(a.u.u_glyphs, 1);
-      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.targets[2].tex); gl.uniform1i(a.u.u_glow, 2);
-      gl.uniform2f(a.u.u_res, w, h);
-      gl.uniform2f(a.u.u_cell, cellW, cellH);
-      gl.uniform1f(a.u.u_lod, Math.log2(Math.max(cellW, cellH)) - 0.5);
-      gl.uniform1f(a.u.u_glyphLod, Math.max(0, Math.log2(this.glyphCell[0] / cellW)));
-      gl.uniform1f(a.u.u_nglyph, this.glyphCount);
-      gl.uniform1f(a.u.u_ramp, this.glyphRamp.length);
-      gl.uniform1f(a.u.u_edge, 0.14);
-      gl.uniform1f(a.u.u_glowK, s.asciiGlow);
-      gl.uniform1f(a.u.u_time, s.time);
-      // vanishing point of the chamber's depth axis on screen (where the eye's −z ray meets the glass)
-      gl.uniform1f(a.u.u_focus, s.focus);
-      gl.uniform1f(a.u.u_dof, s.dof);
-      gl.uniform2f(a.u.u_vanish, (s.eye[0] / s.half[0] * 0.5 + 0.5) * w, (s.eye[1] / s.half[1] * 0.5 + 0.5) * h);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-    }
     gl.activeTexture(gl.TEXTURE0);
   }
 }

@@ -2,7 +2,9 @@
 //!
 //! Units: metres, seconds, amperes, coulombs, volts, kelvin.
 //!
-//! Lava blobs — buoyant blobs heated at the floor and cooled at the ceiling
+//! Qubit chaos — a 6-qubit kicked Ising chain (exact 64-amplitude Floquet evolution)
+//!   drives the charge cells and swirls; Born-rule sampling chooses which cells fire.
+//! Charge cells (formerly lava blobs) — buoyant blobs heated at the floor and cooled at the ceiling
 //!   (Newtonian heating/cooling, Boussinesq buoyancy a = g·(T − T_env)/T_env, linear
 //!   Stokes drag). Their charge follows thermionic emission (Richardson–Dushman):
 //!   hot rising blobs turn positive, cold sinking blobs stay negative.
@@ -21,9 +23,8 @@
 //!   (spatial hash); nearby hot channels of different bolts spawn bridging leaders.
 //! Return stroke — Heidler current (IEC 62305-1), MTLE propagation, CIGRE currents,
 //!   re-strikes, continuing current; T = 4000 + 26000·(I/30 kA)^0.12.
-//! Colour — gas-discharge emission spectra (air N II/O II/N I/O I/H, Ne, Ar, Xe, He, Hg, Kr:
-//!   NIST lines, Boltzmann × Saha, recombination continuum) → CIE 1931 → sRGB.
-//! Vortex tubes — Burgers vortices with precessing axes wrap filaments into helices. Lava: Planck black body
+//! Colour — lightning: air-plasma emission (N II/O II/N I/O I/H lines, Boltzmann ×
+//!   Saha, recombination continuum) → CIE 1931 → sRGB. Lava: Planck black body
 //!   (colour temperature).
 
 #![allow(static_mut_refs)]
@@ -36,7 +37,7 @@ const LUT_TMAX: f32 = 40000.0;
 const BB_N: usize = 256;
 const BB_TMIN: f32 = 800.0;
 const BB_TMAX: f32 = 12000.0;
-const SEG_FLOATS: usize = 9;
+const SEG_FLOATS: usize = 8;
 const MAX_SEGS: usize = 60000;
 const MAX_BOLTS: usize = 10;
 const MAX_BRIDGES: usize = 12;
@@ -148,81 +149,43 @@ fn blackbody(t: f64) -> ([f32; 3], f64) {
     }
     (xyz_to_rgb(x, y, z), y)
 }
-/// Saha equation for a single ionisation stage → ionisation fraction x (n_tot ≈ 0.1 atm).
-fn saha(t: f64, chi_ev: f64, g_ratio: f64) -> f64 {
+fn saha_nitrogen(t: f64) -> f64 {
     let n_tot = 2.5e24;
-    let s = 2.415e21 * t.powf(1.5) * 2.0 * g_ratio * (-chi_ev / (K_B_EV * t)).exp() / n_tot;
+    let s = 2.415e21 * t.powf(1.5) * 4.5 * (-14.534 / (K_B_EV * t)).exp() / n_tot;
     (-s + (s * s + 4.0 * s).sqrt()) / 2.0
 }
-
-/// Gas fills of the chamber. Index 0 is air (real lightning); the others are the noble
-/// gases / vapours used in plasma globes and discharge tubes.
-pub const GAS_N: usize = 7;
-type Line = (f64, f64, f64, u8); // (λ nm, upper level eV, relative gA·abundance, 1 = ion line)
-
-/// Strong visible lines (NIST ASD, rounded) with ionisation energy χ and g-ratio.
-fn gas_lines(gas: usize) -> (&'static [Line], f64, f64) {
-    const AIR: [Line; 21] = [
-        (399.5, 21.60, 0.30, 1), (404.1, 23.42, 0.20, 1), (444.7, 23.20, 0.30, 1), (463.0, 21.16, 0.70, 1),
-        (480.3, 23.24, 0.40, 1), (500.5, 23.14, 1.00, 1), (567.9, 20.67, 0.65, 1), (594.2, 23.24, 0.30, 1),
-        (648.2, 20.41, 0.15, 1), (434.9, 25.85, 0.15, 1), (441.5, 26.25, 0.15, 1), (464.9, 25.66, 0.15, 1),
-        (656.3, 12.09, 0.012, 0), (486.1, 12.75, 0.004, 0), (434.0, 13.05, 0.002, 0), (746.8, 11.99, 0.60, 0),
-        (821.6, 11.84, 0.50, 0), (777.4, 10.74, 1.00, 0), (844.6, 10.99, 0.50, 0), (715.6, 14.46, 0.30, 0),
+/// Air-plasma emission colour at temperature T (lines + continuum).
+fn lightning_color(t: f64) -> ([f32; 3], f64) {
+    let kt = K_B_EV * t;
+    let x_ion = saha_nitrogen(t);
+    // (λ nm, upper level eV, relative gA × abundance, ion?)
+    const LINES: [(f64, f64, f64, u8); 21] = [
+        (399.5, 21.60, 0.30, 1),
+        (404.1, 23.42, 0.20, 1),
+        (444.7, 23.20, 0.30, 1),
+        (463.0, 21.16, 0.70, 1),
+        (480.3, 23.24, 0.40, 1),
+        (500.5, 23.14, 1.00, 1),
+        (567.9, 20.67, 0.65, 1),
+        (594.2, 23.24, 0.30, 1),
+        (648.2, 20.41, 0.15, 1),
+        (434.9, 25.85, 0.15, 1),
+        (441.5, 26.25, 0.15, 1),
+        (464.9, 25.66, 0.15, 1),
+        (656.3, 12.09, 0.012, 0),
+        (486.1, 12.75, 0.004, 0),
+        (434.0, 13.05, 0.002, 0),
+        (746.8, 11.99, 0.60, 0),
+        (821.6, 11.84, 0.50, 0),
+        (777.4, 10.74, 1.00, 0),
+        (844.6, 10.99, 0.50, 0),
+        (715.6, 14.46, 0.30, 0),
         (615.8, 12.75, 0.40, 0),
     ];
-    const NEON: [Line; 10] = [
-        (585.2, 18.97, 1.0, 0), (640.2, 18.56, 1.0, 0), (614.3, 18.64, 0.7, 0), (703.2, 18.38, 0.6, 0),
-        (692.9, 18.64, 0.5, 0), (667.8, 18.69, 0.4, 0), (650.6, 18.58, 0.5, 0), (540.1, 18.97, 0.25, 0),
-        (588.2, 18.73, 0.4, 0), (439.2, 34.80, 0.25, 1),
-    ];
-    const ARGON: [Line; 15] = [
-        (750.4, 13.48, 1.0, 0), (763.5, 13.17, 1.0, 0), (811.5, 13.08, 1.0, 0), (696.5, 13.33, 0.5, 0),
-        (706.7, 13.30, 0.4, 0), (738.4, 13.30, 0.4, 0), (415.9, 14.53, 0.15, 0), (420.1, 14.50, 0.12, 0),
-        (434.8, 19.49, 0.8, 1), (488.0, 19.68, 1.0, 1), (476.5, 19.87, 0.6, 1), (454.5, 19.87, 0.5, 1),
-        (480.6, 19.22, 0.7, 1), (472.7, 19.76, 0.4, 1), (442.6, 19.55, 0.5, 1),
-    ];
-    const XENON: [Line; 14] = [
-        (467.1, 11.00, 0.6, 0), (462.4, 10.97, 0.4, 0), (473.4, 10.97, 0.3, 0), (823.2, 9.82, 1.0, 0),
-        (828.0, 9.93, 1.0, 0), (881.9, 9.82, 1.0, 0), (492.3, 10.98, 0.3, 0), (484.4, 14.10, 0.8, 1),
-        (529.2, 14.10, 0.6, 1), (541.9, 14.10, 0.7, 1), (460.3, 14.10, 0.6, 1), (533.9, 14.10, 0.4, 1),
-        (605.1, 14.10, 0.4, 1), (699.1, 14.10, 0.3, 1),
-    ];
-    const HELIUM: [Line; 9] = [
-        (587.6, 23.07, 1.0, 0), (667.8, 23.07, 0.3, 0), (706.5, 22.72, 0.4, 0), (501.6, 23.09, 0.25, 0),
-        (447.1, 23.74, 0.4, 0), (492.2, 23.74, 0.1, 0), (388.9, 23.01, 0.4, 0), (471.3, 23.59, 0.1, 0),
-        (468.6, 51.00, 0.5, 1),
-    ];
-    const MERCURY: [Line; 7] = [
-        (435.8, 7.73, 1.0, 0), (546.1, 7.73, 1.0, 0), (404.7, 7.73, 0.6, 0), (577.0, 8.85, 0.35, 0),
-        (579.1, 8.84, 0.4, 0), (491.6, 8.84, 0.08, 0), (407.8, 7.73, 0.1, 0),
-    ];
-    const KRYPTON: [Line; 11] = [
-        (557.0, 12.14, 0.8, 0), (587.1, 12.14, 0.8, 0), (760.2, 11.55, 1.0, 0), (811.3, 11.44, 1.0, 0),
-        (431.9, 12.86, 0.3, 0), (450.2, 12.79, 0.25, 0), (445.4, 12.85, 0.2, 0), (435.5, 16.20, 0.6, 1),
-        (461.9, 16.30, 0.5, 1), (473.9, 16.30, 0.4, 1), (483.2, 16.30, 0.4, 1),
-    ];
-    match gas {
-        1 => (&NEON, 21.565, 1.5),
-        2 => (&ARGON, 15.760, 1.5),
-        3 => (&XENON, 12.130, 1.5),
-        4 => (&HELIUM, 24.587, 2.0),
-        5 => (&MERCURY, 10.438, 1.0),
-        6 => (&KRYPTON, 13.999, 1.5),
-        _ => (&AIR, 14.534, 2.25),
-    }
-}
-
-/// Emission colour of a gas-discharge channel at temperature T: Boltzmann-weighted lines of
-/// the neutral (1 − x) and ion (x) stages from the Saha balance, plus a recombination /
-/// bremsstrahlung continuum ∝ x² with Planck shape. → (sRGB chromaticity, luminance Y).
-fn gas_color(t: f64, gas: usize) -> ([f32; 3], f64) {
-    let kt = K_B_EV * t;
-    let (lines, chi, g) = gas_lines(gas);
-    let x_ion = saha(t, chi, g);
     let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
-    for &(lam, eu, gw, ion) in lines.iter() {
+    for &(lam, eu, g, ion) in LINES.iter() {
         let frac = if ion == 1 { x_ion } else { 1.0 - x_ion };
-        let i = 3.0e12 * gw * frac * (-eu / kt).exp();
+        let i = 3.0e12 * g * frac * (-eu / kt).exp();
         let (cx, cy, cz) = cie_xyz(lam);
         x += i * cx;
         y += i * cy;
@@ -265,6 +228,181 @@ fn t_of_current(i: f32) -> f32 {
     (4000.0 + 26000.0 * (i / 30_000.0).powf(0.12)).min(38_000.0)
 }
 
+
+// ---------------------------------------------------------------- qubit chaos
+/// Six-qubit kicked Ising chain — a standard quantum-chaotic Floquet system
+/// (Prosen; Kim & Huse 2013 ergodic point J = 1, h = 0.9045, g = 0.8090).
+/// One period: U = exp(−i h τ Σ σˣ) · exp(−i τ [J Σ σᶻσᶻ + g Σ σᶻ]), applied exactly
+/// to the full 2⁶ = 64-amplitude state vector. The single-qubit Bloch vectors
+/// ⟨σˣ,σʸ,σᶻ⟩ wander chaotically and shrink as the qubits entangle; the Rényi-2
+/// entanglement entropy of the 3|3 cut is S₂ = −log₂ Tr ρ_A².
+const NQ: usize = 6;
+const QDIM: usize = 1 << NQ;
+
+struct Quantum {
+    re: [f64; QDIM],
+    im: [f64; QDIM],
+    prev: [V3; NQ],
+    bloch: [V3; NQ],
+    acc: f32,
+    s2: f32,
+    kicks: u64,
+}
+
+impl Quantum {
+    fn new(rng: &mut Rng) -> Quantum {
+        // random product state ⊗ₖ (cos θₖ/2 |0⟩ + e^{iφₖ} sin θₖ/2 |1⟩)
+        let mut q = Quantum { re: [0.0; QDIM], im: [0.0; QDIM], prev: [[0.0; 3]; NQ], bloch: [[0.0; 3]; NQ], acc: 0.0, s2: 0.0, kicks: 0 };
+        let mut amp = [(0.0f64, 0.0f64, 0.0f64, 0.0f64); NQ];
+        for k in 0..NQ {
+            let th = rng.range(0.3, 2.8) as f64;
+            let ph = rng.range(0.0, 6.283) as f64;
+            amp[k] = ((th / 2.0).cos(), 0.0, (th / 2.0).sin() * ph.cos(), (th / 2.0).sin() * ph.sin());
+        }
+        for st in 0..QDIM {
+            let (mut r, mut i) = (1.0f64, 0.0f64);
+            for k in 0..NQ {
+                let (ar, ai) = if st >> k & 1 == 0 { (amp[k].0, amp[k].1) } else { (amp[k].2, amp[k].3) };
+                let nr = r * ar - i * ai;
+                i = r * ai + i * ar;
+                r = nr;
+            }
+            q.re[st] = r;
+            q.im[st] = i;
+        }
+        q.measure_bloch();
+        q.prev = q.bloch;
+        q
+    }
+
+    fn kick(&mut self, j: f64, h: f64, g: f64, tau: f64) {
+        // diagonal Ising part: phase e^{−iτE(s)}, E = J Σ zₖzₖ₊₁ + g Σ zₖ (open chain)
+        for st in 0..QDIM {
+            let z = |k: usize| if st >> k & 1 == 0 { 1.0 } else { -1.0 };
+            let mut e = 0.0;
+            for k in 0..NQ {
+                e += g * z(k);
+                if k + 1 < NQ {
+                    e += j * z(k) * z(k + 1);
+                }
+            }
+            let (c, sn) = ((e * tau).cos(), -(e * tau).sin());
+            let (r, i) = (self.re[st], self.im[st]);
+            self.re[st] = r * c - i * sn;
+            self.im[st] = r * sn + i * c;
+        }
+        // transverse field on every qubit: exp(−i hτ σˣ) = [[c, −is], [−is, c]]
+        let (c, sn) = ((h * tau).cos(), (h * tau).sin());
+        for k in 0..NQ {
+            let bit = 1 << k;
+            for s0 in 0..QDIM {
+                if s0 & bit != 0 {
+                    continue;
+                }
+                let s1 = s0 | bit;
+                let (r0, i0, r1, i1) = (self.re[s0], self.im[s0], self.re[s1], self.im[s1]);
+                // a0' = c a0 − i s a1 ; a1' = −i s a0 + c a1
+                self.re[s0] = c * r0 + sn * i1;
+                self.im[s0] = c * i0 - sn * r1;
+                self.re[s1] = sn * i0 + c * r1;
+                self.im[s1] = -sn * r0 + c * i1;
+            }
+        }
+        self.kicks += 1;
+        self.prev = self.bloch;
+        self.measure_bloch();
+    }
+
+    fn measure_bloch(&mut self) {
+        for k in 0..NQ {
+            let bit = 1 << k;
+            let (mut x, mut y, mut z) = (0.0f64, 0.0f64, 0.0f64);
+            for s0 in 0..QDIM {
+                let p = self.re[s0] * self.re[s0] + self.im[s0] * self.im[s0];
+                if s0 & bit != 0 {
+                    z -= p;
+                    continue;
+                }
+                z += p;
+                let s1 = s0 | bit;
+                // conj(a0)·a1
+                let cr = self.re[s0] * self.re[s1] + self.im[s0] * self.im[s1];
+                let ci = self.re[s0] * self.im[s1] - self.im[s0] * self.re[s1];
+                x += 2.0 * cr;
+                y += 2.0 * ci;
+            }
+            self.bloch[k] = [x as f32, y as f32, z as f32];
+        }
+        // Rényi-2 entropy of qubits {0,1,2} vs {3,4,5}: ρ_A = M M†, M[a][b] = ψ(a + 8b)
+        let mut rho = [[(0.0f64, 0.0f64); 8]; 8];
+        for a in 0..8 {
+            for a2 in 0..8 {
+                let (mut sr, mut si) = (0.0, 0.0);
+                for b in 0..8 {
+                    let (xr, xi) = (self.re[a + 8 * b], self.im[a + 8 * b]);
+                    let (yr, yi) = (self.re[a2 + 8 * b], -self.im[a2 + 8 * b]);
+                    sr += xr * yr - xi * yi;
+                    si += xr * yi + xi * yr;
+                }
+                rho[a][a2] = (sr, si);
+            }
+        }
+        let mut pur = 0.0;
+        for a in 0..8 {
+            for a2 in 0..8 {
+                pur += rho[a][a2].0 * rho[a][a2].0 + rho[a][a2].1 * rho[a][a2].1;
+            }
+        }
+        self.s2 = (-(pur.max(1e-12)).log2()) as f32;
+    }
+
+    /// Projective σᶻ measurement of qubit k with Born-rule outcome probabilities;
+    /// the state collapses onto the observed branch and is renormalised.
+    fn measure(&mut self, k: usize, u: f32) -> u8 {
+        let bit = 1 << k;
+        let mut p1 = 0.0f64;
+        for st in 0..QDIM {
+            if st & bit != 0 {
+                p1 += self.re[st] * self.re[st] + self.im[st] * self.im[st];
+            }
+        }
+        let one = (u as f64) < p1;
+        let norm = if one { p1 } else { 1.0 - p1 }.max(1e-12).sqrt();
+        for st in 0..QDIM {
+            if (st & bit != 0) != one {
+                self.re[st] = 0.0;
+                self.im[st] = 0.0;
+            } else {
+                self.re[st] /= norm;
+                self.im[st] /= norm;
+            }
+        }
+        self.prev = self.bloch;
+        self.measure_bloch();
+        one as u8
+    }
+
+    /// Born-rule projective sample of a basis state (without collapsing the state).
+    fn sample(&self, u: f32) -> usize {
+        let mut r = u as f64;
+        for st in 0..QDIM {
+            r -= self.re[st] * self.re[st] + self.im[st] * self.im[st];
+            if r <= 0.0 {
+                return st;
+            }
+        }
+        QDIM - 1
+    }
+
+    /// Bloch vector of qubit k, interpolated smoothly between kicks.
+    fn bloch_at(&self, k: usize) -> V3 {
+        let t = self.acc.clamp(0.0, 1.0);
+        let s = t * t * (3.0 - 2.0 * t);
+        let (a, b) = (self.prev[k % NQ], self.bloch[k % NQ]);
+        [a[0] + (b[0] - a[0]) * s, a[1] + (b[1] - a[1]) * s, a[2] + (b[2] - a[2]) * s]
+    }
+}
+
 // ---------------------------------------------------------------- model
 #[derive(Clone, Copy)]
 struct Node {
@@ -295,7 +433,6 @@ struct Tip {
 
 struct Bolt {
     uid: u32,
-    hue: f32, // psychedelic gas-coordinate phase
     nodes: Vec<Node>,
     tips: Vec<Tip>,
     phase: Phase,
@@ -321,17 +458,6 @@ struct Blob {
     temp: f32, // K (lava colour temperature)
     q: f32,    // C
     a: f32,    // radius (m)
-}
-
-/// Burgers vortex tube: swirl u_θ = Γ/(2πr)(1 − e^{−r²/r_c²}) about a wandering axis,
-/// with a gentle axial strain that draws filaments in and stretches them into helices.
-#[derive(Clone, Copy)]
-struct Tube {
-    p: V3,
-    axis: V3,
-    gamma: f32,
-    rc: f32,
-    spin: V3, // slow precession of the axis
 }
 
 /// One Fourier mode of the kinematic-simulation turbulence field.
@@ -373,10 +499,10 @@ const P_LEADER_SPEED: usize = 18;
 const P_TURB: usize = 19; // rms turbulent velocity (m/s)
 const P_EDDY: usize = 20; // largest eddy size (m)
 const P_DIFFUSE: usize = 21; // small-scale (mist) diffusivity (m²/s)
-const P_GAS: usize = 22; // 0..6 gas fill, 7 = psychedelic (flowing through all spectra)
-const P_PSY: usize = 23; // psychedelic colour-flow speed
-const P_VORTEX: usize = 24; // vortex-tube circulation scale
-const P_TUBES: usize = 25; // number of vortex tubes
+const P_KICKS: usize = 22; // Floquet kicks per second
+const P_HFIELD: usize = 23; // transverse field h (0 = integrable, ~0.9 = chaotic)
+const P_QSWIRL: usize = 24; // strength of the qubit-driven swirls
+const P_MEASURE: usize = 25; // measurement probability per qubit per kick
 const N_PARAMS: usize = 26;
 
 struct Grid {
@@ -417,7 +543,7 @@ struct Sim {
     fdims: [usize; 3],
     fcell: V3,
     flow_frame: u32,
-    tubes: Vec<Tube>,
+    q: Quantum,
 }
 
 static mut SIM: Option<Sim> = None;
@@ -435,7 +561,6 @@ fn cell_of(p: V3, h: V3, dims: [usize; 3]) -> usize {
 fn placeholder() -> Bolt {
     Bolt {
         uid: 0,
-        hue: 0.0,
         nodes: Vec::new(),
         tips: Vec::new(),
         phase: Phase::Fizzle,
@@ -458,32 +583,32 @@ fn placeholder() -> Bolt {
 impl Sim {
     fn new(seed: u32) -> Sim {
         let mut p = [0.0; N_PARAMS];
-        p[P_BOLTS] = 5.0;
-        p[P_BLOBS] = 7.0;
+        p[P_BOLTS] = 4.0;
+        p[P_BLOBS] = 6.0;
         p[P_HEAT] = 1.0;
         p[P_FLOW] = 1.0;
         p[P_ETA] = 2.6;
         p[P_QUANTUM] = 0.25;
         p[P_BETA_LOG] = 4.4;
         p[P_WORKFN] = 4.5;
-        p[P_BRANCH] = 0.7;
+        p[P_BRANCH] = 0.35;
         p[P_CONNECT] = 170.0;
         p[P_IPEAK] = 31.0;
         p[P_ICC] = 2500.0;
         p[P_RESTRIKE] = 1.0;
         p[P_SLOWMO] = 0.0005;
         p[P_LIFE] = 11.0;
-        p[P_CRACKLE] = 0.45;
+        p[P_CRACKLE] = 0.3;
         p[P_TENSION] = 0.3;
         p[P_LEADER_SPEED] = 170.0;
-        p[P_TURB] = 70.0;
+        p[P_TURB] = 30.0;
         p[P_EDDY] = 1400.0;
-        p[P_DIFFUSE] = 60.0;
-        p[P_GAS] = 7.0;
-        p[P_PSY] = 1.0;
-        p[P_VORTEX] = 1.0;
-        p[P_TUBES] = 3.0;
-        p[P_FLOW] = 0.4;
+        p[P_DIFFUSE] = 40.0;
+        p[P_KICKS] = 2.5;
+        p[P_HFIELD] = 0.9045;
+        p[P_QSWIRL] = 1.0;
+        p[P_MEASURE] = 0.2;
+        p[P_FLOW] = 0.15;
         let mut s = Sim {
             rng: Rng(0x853c49e6748fea9b ^ ((seed as u64) << 21 | seed as u64)),
             p,
@@ -504,7 +629,7 @@ impl Sim {
             out: vec![0.0; MAX_SEGS * SEG_FLOATS],
             blob_out: vec![0.0; MAX_BLOBS * 8],
             info: [0.0; 16],
-            lut: vec![0.0; LUT_N * 4 * (GAS_N + 1)],
+            lut: vec![0.0; LUT_N * 4],
             bb_lut: vec![0.0; BB_N * 4],
             kids: Vec::new(),
             first_child: Vec::new(),
@@ -515,22 +640,16 @@ impl Sim {
             fdims: [2, 2, 2],
             fcell: [1.0; 3],
             flow_frame: 0,
-            tubes: Vec::new(),
+            q: Quantum::new(&mut Rng(0x2545F4914F6CDD1D ^ seed as u64)),
         };
-        // emission-colour table: one row per gas (row GAS_N repeats air so the
-        // psychedelic gas coordinate can wrap around smoothly)
-        for gas in 0..=GAS_N {
-            let gi = gas % GAS_N;
-            let yref = gas_color(30000.0, gi).1;
-            for i in 0..LUT_N {
-                let t = LUT_TMIN + (LUT_TMAX - LUT_TMIN) * i as f32 / (LUT_N - 1) as f32;
-                let (c, y) = gas_color(t as f64, gi);
-                let o = (gas * LUT_N + i) * 4;
-                s.lut[o..o + 3].copy_from_slice(&c);
-                // perceived brightness: Fechner's law over ~7 decades
-                let f = (1.0 + (y / yref).max(1e-30).log10() / 7.0).max(0.0);
-                s.lut[o + 3] = (f * f) as f32;
-            }
+        let yref = lightning_color(30000.0).1;
+        for i in 0..LUT_N {
+            let t = LUT_TMIN + (LUT_TMAX - LUT_TMIN) * i as f32 / (LUT_N - 1) as f32;
+            let (c, y) = lightning_color(t as f64);
+            s.lut[i * 4..i * 4 + 3].copy_from_slice(&c);
+            // perceived brightness: Fechner's law over ~7 decades
+            let f = (1.0 + (y / yref).max(1e-30).log10() / 7.0).max(0.0);
+            s.lut[i * 4 + 3] = (f * f) as f32;
         }
         let yb = blackbody(2500.0).1;
         for i in 0..BB_N {
@@ -566,18 +685,49 @@ impl Sim {
         self.blobs.truncate(n);
     }
 
+    /// Point of the chamber represented by qubit k: its Bloch ball mapped onto the box
+    /// (pure states reach out toward the walls, entangled/mixed ones sit near the centre).
+    fn qubit_point(&self, k: usize) -> V3 {
+        let b0 = self.q.bloch_at(k);
+        let m = len(b0);
+        // radius ∝ √|b| so partly-entangled qubits still move visibly
+        let b = if m > 1e-4 { mul(b0, m.sqrt() / m) } else { b0 };
+        let h = self.half;
+        // fixed per-qubit rotation so the six qubits don't share the same axes
+        let a = k as f32 * 1.047;
+        let (c, s) = (a.cos(), a.sin());
+        let r = [b[0] * c - b[2] * s, b[1], b[0] * s + b[2] * c];
+        [r[0] * h[0] * 0.75, r[1] * h[1] * 0.75, r[2] * h[2] * 0.75]
+    }
+
+    fn update_quantum(&mut self, dt: f32) {
+        let rate = self.p[P_KICKS] * (1.0 + 2.0 * self.p[P_MIC]);
+        self.q.acc += dt * rate;
+        while self.q.acc >= 1.0 {
+            self.q.acc -= 1.0;
+            let h = self.p[P_HFIELD] as f64;
+            self.q.kick(1.0, h, 0.8090, 1.0);
+            // weak monitoring: each qubit is measured with probability p per kick
+            // (measurement vs. scrambling keeps the dynamics jumping and chaotic)
+            let pm = self.p[P_MEASURE];
+            for k in 0..NQ {
+                if self.rng.f() < pm {
+                    let u = self.rng.f();
+                    self.q.measure(k, u);
+                }
+            }
+        }
+    }
+
     fn move_blobs(&mut self, dt: f32) {
         let h = self.half;
-        let heat = self.p[P_HEAT] * (1.0 + self.p[P_MIC]);
         let n = self.blobs.len();
-        let (t_env, t_hot, t_cold) = (1900.0f32, 2700.0f32, 1250.0f32);
-        let g = 9.81f32;
         for i in 0..n {
             let mut acc = [0.0f32; 3];
             let b = self.blobs[i];
-            // Boussinesq buoyancy (scaled to the chamber): a_y = g·(T − T_env)/T_env
-            acc[1] += g * (b.temp - t_env) / t_env * 9.0 * heat;
-            // soft contact between blobs
+            // each charge cell is tied to a qubit: pulled toward that qubit's Bloch point
+            let target = self.qubit_point(i);
+            acc = add(acc, mul(sub(target, b.p), 1.4));
             for j in 0..n {
                 if i == j {
                     continue;
@@ -598,26 +748,12 @@ impl Sim {
                     acc[k] += (-lim - b.p[k]) * 1.5;
                 }
             }
-            acc = add(acc, mul(self.rng.gauss3(), 6.0));
+            // charge follows the qubit's spin expectation: q = Q·⟨σᶻ⟩ (polarity flips as it evolves)
+            let sz = self.q.bloch_at(i)[2];
             let bm = &mut self.blobs[i];
-            bm.v = add(bm.v, mul(sub(acc, mul(bm.v, 0.35)), dt)); // Stokes drag
+            bm.v = add(bm.v, mul(sub(acc, mul(bm.v, 1.6)), dt)); // overdamped (Stokes drag)
             bm.p = add(bm.p, mul(bm.v, dt));
-            // Newtonian heating at the floor, cooling at the ceiling
-            let yrel = bm.p[1] / h[1];
-            let (target, rate) = if yrel < -0.65 {
-                (t_hot, 0.35 * heat)
-            } else if yrel > 0.6 {
-                (t_cold, 0.35 * heat)
-            } else {
-                (t_env, 0.01)
-            };
-            bm.temp += (target - bm.temp) * (rate * dt).min(1.0);
-            // thermionic charging (Richardson–Dushman J = A·T²·e^{−W/kT}): hot blobs boil off
-            // electrons and turn positive, cold blobs keep a negative charge
-            let w_ev = 2.0f32; // effective work function of the lava surface (eV)
-            let rd = |t: f32| t * t * (-w_ev / (8.617e-5 * t)).exp();
-            let j_rel = rd(bm.temp) / rd(t_env);
-            bm.q = 14.0 * (j_rel.ln() / 2.5).tanh();
+            bm.q = 16.0 * sz.signum() * sz.abs().sqrt();
             for k in 0..3 {
                 bm.p[k] = bm.p[k].clamp(-h[k] + bm.a * 0.5, h[k] - bm.a * 0.5);
             }
@@ -677,8 +813,7 @@ impl Sim {
         g.clear();
         g.resize(n, [0.0; 3]);
         let t = self.time;
-        // the turbulence slowly 'breathes' (two incommensurate periods → never repeats)
-        let tscale = (1.0 + 1.5 * self.p[P_MIC]) * (1.0 + 0.35 * (self.time * 0.13).sin() + 0.2 * (self.time * 0.051).sin());
+        let tscale = 1.0 + 1.5 * self.p[P_MIC];
         // separable phasors: e^{i(k·x+ωt)} = e^{i kx x}·e^{i ky y}·e^{i(kz z + ωt)}
         let mut px = vec![(0.0f32, 0.0f32); dims[0]];
         let mut py = vec![(0.0f32, 0.0f32); dims[1]];
@@ -743,58 +878,10 @@ impl Sim {
         self.fgrid = g;
     }
 
-    fn update_tubes(&mut self, dt: f32) {
-        let n = (self.p[P_TUBES] as usize).min(8);
-        let h = self.half;
-        while self.tubes.len() < n {
-            let sign = if self.tubes.len() % 2 == 0 { 1.0 } else { -1.0 };
-            let t = Tube {
-                p: [self.rng.range(-0.5, 0.5) * h[0], self.rng.range(-0.5, 0.5) * h[1], self.rng.range(-0.5, 0.5) * h[2]],
-                axis: norm(self.rng.gauss3()),
-                gamma: sign * self.rng.range(0.8, 1.3) * 2.5e5,
-                rc: self.rng.range(120.0, 220.0),
-                spin: mul(self.rng.gauss3(), 0.08),
-            };
-            self.tubes.push(t);
-        }
-        self.tubes.truncate(n);
-        for i in 0..self.tubes.len() {
-            let wander = mul(self.rng.gauss3(), 25.0 * dt.sqrt());
-            let v = self.velocity(self.tubes[i].p);
-            let tb = &mut self.tubes[i];
-            tb.p = add(tb.p, add(mul(v, dt * 0.4), wander));
-            for a in 0..3 {
-                tb.p[a] = tb.p[a].clamp(-0.6 * h[a], 0.6 * h[a]);
-            }
-            // precess the axis: a ← a + (ω × a) dt
-            let w = tb.spin;
-            let ax = tb.axis;
-            let c = [w[1] * ax[2] - w[2] * ax[1], w[2] * ax[0] - w[0] * ax[2], w[0] * ax[1] - w[1] * ax[0]];
-            tb.axis = norm(add(ax, mul(c, dt)));
-        }
-    }
-
-    /// Blob-driven Stokes flow, Burgers vortex tubes and gentle convection rolls.
+    /// Blob-driven Stokes flow and gentle convection rolls (lava-lamp component).
     fn flow_extra(&self, x: V3) -> V3 {
         let h = self.half;
         let mut u = [0.0f32; 3];
-        let vs = self.p[P_VORTEX] * (1.0 + 0.4 * (self.time * 0.21).sin());
-        for tb in self.tubes.iter() {
-            let d = sub(x, tb.p);
-            let along = dot(d, tb.axis);
-            let rv = sub(d, mul(tb.axis, along));
-            let r2 = dot(rv, rv) + 1.0;
-            let r = r2.sqrt();
-            let rc2 = tb.rc * tb.rc;
-            // azimuthal swirl (θ̂ = axis × r̂)
-            let th = [tb.axis[1] * rv[2] - tb.axis[2] * rv[1], tb.axis[2] * rv[0] - tb.axis[0] * rv[2], tb.axis[0] * rv[1] - tb.axis[1] * rv[0]];
-            let ut = tb.gamma * vs / (2.0 * PI * r2) * (1.0 - (-r2 / rc2).exp());
-            u = add(u, mul(th, ut));
-            // Burgers strain: inflow −αr/2, axial outflow αz (Gaussian-limited)
-            let alpha = 0.05 * vs * (-r2 / (16.0 * rc2)).exp() * (-(along * along) / (4.0e6)).exp();
-            u = add(u, add(mul(rv, -0.5 * alpha), mul(tb.axis, alpha * along)));
-            let _ = r;
-        }
         for b in self.blobs.iter() {
             let d = sub(x, b.p);
             let r2 = dot(d, d);
@@ -804,6 +891,29 @@ impl Sim {
             let c1 = (r2 + 2.0 * e2) / den;
             let c2 = dot(b.v, d) / den;
             u = add(u, mul(add(mul(b.v, c1), mul(d, c2)), 0.75 * b.a));
+        }
+        // qubit swirls: a Lamb–Oseen vortex at each qubit's point, axis = its Bloch vector,
+        // circulation ∝ |Bloch| (pure qubits swirl strongly, entangled ones fade)
+        let qs = self.p[P_QSWIRL];
+        if qs > 0.0 {
+            for k in 0..NQ {
+                let bv = self.q.bloch_at(k);
+                let m = len(bv);
+                if m < 0.05 {
+                    continue;
+                }
+                let axis = mul(bv, 1.0 / m);
+                let c = self.qubit_point(k);
+                let d = sub(x, c);
+                let along = dot(d, axis);
+                let rv = sub(d, mul(axis, along));
+                let r2 = dot(rv, rv) + 1.0;
+                let rc2 = 220.0f32 * 220.0;
+                let th = [axis[1] * rv[2] - axis[2] * rv[1], axis[2] * rv[0] - axis[0] * rv[2], axis[0] * rv[1] - axis[1] * rv[0]];
+                let gam = 2.6e5 * qs * m * if k % 2 == 0 { 1.0 } else { -1.0 };
+                let ut = gam / (2.0 * PI * r2) * (1.0 - (-r2 / rc2).exp()) * (-(along * along) / (2.0 * 700.0 * 700.0)).exp();
+                u = add(u, mul(th, ut));
+            }
         }
         let flow = self.p[P_FLOW] * (1.0 + 1.5 * self.p[P_MIC]);
         let xx = (x[0] + h[0]) / (2.0 * h[0]);
@@ -932,16 +1042,23 @@ impl Sim {
         b.target = target;
         b.bridge = bridge;
         b.life = life;
-        b.hue = self.rng.f() * GAS_N as f32;
         self.bolts.push(b);
     }
 
     fn spawn_main(&mut self) {
-        let negs: Vec<usize> = (0..self.blobs.len()).filter(|&i| self.blobs[i].q < 0.0).collect();
+        let negs: Vec<usize> = (0..self.blobs.len()).filter(|&i| self.blobs[i].q < -1.0).collect();
         if negs.is_empty() {
             return;
         }
-        let b = self.blobs[negs[(self.rng.f() * negs.len() as f32) as usize % negs.len()]];
+        // Born-rule measurement of the 6-qubit state picks which charge cells may fire:
+        // the cells whose qubit was measured in |1⟩ are the candidates.
+        let st = self.q.sample(self.rng.f());
+        let cands: Vec<usize> = negs.iter().cloned().filter(|&i| st >> (i % NQ) & 1 == 1).collect();
+        let pool = if cands.is_empty() { &negs } else { &cands };
+        let bi = pool[(self.rng.f() * pool.len() as f32) as usize % pool.len()];
+        let b = self.blobs[bi];
+        let u = self.rng.f();
+        self.q.measure(bi % NQ, u); // the discharge acts as a detector of that qubit
         let d = norm(self.rng.gauss3());
         let start = add(b.p, mul(d, b.a * 1.05));
         let e = mul(self.efield(start), -1.0);
@@ -1321,10 +1438,10 @@ impl Sim {
         self.strikes = 0;
         self.restrikes = 0;
         self.ensure_blobs();
+        self.update_quantum(dt);
         self.move_blobs(dt);
         // eddies evolve slowly: refresh the velocity grid every other frame
         self.flow_frame = self.flow_frame.wrapping_add(1);
-        self.update_tubes(dt);
         if self.flow_frame % 2 == 0 || self.fgrid.is_empty() {
             self.build_flow();
         }
@@ -1371,18 +1488,6 @@ impl Sim {
         self.emit()
     }
 
-    /// Gas coordinate of a channel point: a fixed gas, or (psychedelic) a phase that flows
-    /// along the channel and through time, so the colour drifts through the real emission
-    /// spectra of the different gases.
-    fn gas_coord(&self, b: &Bolt, dist: f32) -> f32 {
-        let g = self.p[P_GAS];
-        if g < 6.5 {
-            return g.round().clamp(0.0, (GAS_N - 1) as f32);
-        }
-        let ph = b.hue + self.time * 0.12 * self.p[P_PSY] + dist * 0.0009;
-        ph.rem_euclid(GAS_N as f32)
-    }
-
     fn emit(&mut self) -> u32 {
         let crackle = self.p[P_CRACKLE];
         let mut k = 0usize;
@@ -1417,7 +1522,6 @@ impl Sim {
                 self.out[o + 3..o + 6].copy_from_slice(&e);
                 self.out[o + 6] = t;
                 self.out[o + 7] = if has_child[i] { w } else { -w };
-                self.out[o + 8] = self.gas_coord(b, nd.dist + nd.depth as f32 * 120.0);
                 let li = (((t - LUT_TMIN) / (LUT_TMAX - LUT_TMIN)) * (LUT_N - 1) as f32).clamp(0.0, (LUT_N - 1) as f32) as usize;
                 let lum = self.lut[li * 4 + 3] * w * STEP;
                 act += lum;
@@ -1450,7 +1554,6 @@ impl Sim {
                 self.out[o + 3..o + 6].copy_from_slice(&nb.p);
                 self.out[o + 6] = t;
                 self.out[o + 7] = 0.9;
-                self.out[o + 8] = self.gas_coord(a, na.dist);
                 k += 1;
             }
         }
@@ -1480,6 +1583,7 @@ impl Sim {
         self.info[12] = self.tip_field;
         self.info[13] = self.fn_j;
         self.info[14] = self.links.len() as f32;
+        self.info[15] = self.q.s2;
         k as u32
     }
 }
@@ -1550,13 +1654,24 @@ pub extern "C" fn blob_ptr() -> *const f32 {
 pub extern "C" fn info_ptr() -> *const f32 {
     sim().info.as_ptr()
 }
+/// Qubit read-out: [S₂, kicks, then 6 × (x, y, z) Bloch vectors].
+#[no_mangle]
+pub extern "C" fn qubits_ptr() -> *const f32 {
+    static mut Q: [f32; 2 + 3 * NQ] = [0.0; 2 + 3 * NQ];
+    let s = sim();
+    unsafe {
+        Q[0] = s.q.s2;
+        Q[1] = s.q.kicks as f32;
+        for k in 0..NQ {
+            let b = s.q.bloch_at(k);
+            Q[2 + 3 * k..5 + 3 * k].copy_from_slice(&b);
+        }
+        Q.as_ptr()
+    }
+}
 #[no_mangle]
 pub extern "C" fn lut_ptr() -> *const f32 {
     sim().lut.as_ptr()
-}
-#[no_mangle]
-pub extern "C" fn lut_rows() -> u32 {
-    (GAS_N + 1) as u32
 }
 #[no_mangle]
 pub extern "C" fn lut_len() -> u32 {
